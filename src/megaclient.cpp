@@ -3071,7 +3071,9 @@ void MegaClient::exec()
                     insca = false;
                     insca_notlast = false;
                     jsonsc.begin(data);
-                    if (*jsonsc.pos == '{') // Enter only when first started
+                    // Enter only when first started
+                    if (!pendingsc->mChunked ||
+                        (pendingsc->mChunked && mScChunkedStatus == ScChunkedStatus::NotStarted && *jsonsc.pos == '{'))
                     {
                         jsonsc.enterobject();
                     }
