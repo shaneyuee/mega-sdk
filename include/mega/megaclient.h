@@ -1739,6 +1739,19 @@ private:
     std::unique_ptr<HttpReq> pendingscUserAlerts;
     BackoffTimer btsc;
 
+    // server-client chunked context data
+    enum class ScChunkedStatus
+    {
+        NotStarted,
+        ProcessingAction,
+        ProcessingTElement
+    };
+    ScChunkedStatus mScChunkedStatus = ScChunkedStatus::NotStarted;
+    std::shared_ptr<Node> mScChunkedLastAPDeletedNode;
+    bool mScChunkedFirstHandleMatchesDelete = false;
+    bool mScChunkedFIsV2 = false;
+    handle mScChunkedOriginatingUserHandle = UNDEF;
+
     int mPendingCatchUps = 0;
     bool mReceivingCatchUp = false;
 
@@ -2441,6 +2454,10 @@ public:
     void handleauth(handle, byte*);
 
     bool procsc();
+    int procscchunk();
+    bool isSelfOriginatingAction(const char* json, nameid name);
+    bool processActionPacket(const char* startpos);
+    void processTElement(const char* startpos);
     size_t procreqstat();
 
     // API warnings
