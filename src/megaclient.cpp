@@ -6738,7 +6738,7 @@ void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& fir
     {
         for (;;)
         {
-            switch (jsonsc.getnameid())
+            switch (j->getnameid()) // mis-use jsonsc?
             {
                 case makeNameid("f"):
                     if (auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen)))
@@ -6787,7 +6787,7 @@ void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& fir
                     return;
 
                 default:
-                    if (!jsonsc.storeobject())
+                    if (!j->storeobject()) // mis-use jsonsc?
                     {
                         return;
                     }
