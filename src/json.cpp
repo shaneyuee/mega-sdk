@@ -84,7 +84,7 @@ bool JSON::storeobject(string* s)
 
             if (!*ptr)
             {
-                LOG_err << "Parse error (\")";
+                LOG_err << "Parse error (\"), incomplete json.";
                 return false;
             }
         }
@@ -286,7 +286,12 @@ nameid JSON::getNameidSkipNull(bool skipnullvalues)
             id = (id << 8) + static_cast<nameid>(*ptr++);
         }
 
-        assert(*ptr == '"'); // if either assert fails, check the json syntax, it might be something new/changed
+        // For on-the-fly processing, json is probably incomplete
+        // If we reach the end of the string without finding a closing quote, we can't extract a valid nameid
+        if (*ptr == 0)
+        {
+            return EOO;
+        }
         pos = ptr + 1;
 
         if (*pos == ':' || *pos == ',' )
