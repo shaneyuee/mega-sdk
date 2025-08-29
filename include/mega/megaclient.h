@@ -1360,6 +1360,9 @@ public:
     std::string cypherTLVTextWithMasterKey(const char* name, const std::string& text);
     std::string decypherTLVTextWithMasterKey(const char* name, const std::string& text);
 
+    // Copy file in the cloud
+    bool copyRemoteFile(File *localfile, shared_ptr<Node> cloudnode, int tag);
+
     // close all open HTTP connections
     void disconnect();
 

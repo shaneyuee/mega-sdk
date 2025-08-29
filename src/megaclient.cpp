@@ -18049,6 +18049,63 @@ string MegaClient::decypherTLVTextWithMasterKey(const char* name, const string& 
     return records ? (*records)[name] : string{};
 }
 
+bool MegaClient::copyRemoteFile(File *f, shared_ptr<Node> samenode, int tag)
+{
+    // Create a new node that references the same file data (deduplication)
+    // Don't copy the nodehandle to avoid conflicts, let server assign new one
+    TreeProcCopy tc;
+    proctree(samenode, &tc, false, true);
+    tc.allocnodes();
+    proctree(samenode, &tc, false, true);
+
+    // Must set parent handle to UNDEF
+    tc.nn[0].parenthandle = UNDEF;
+
+    // Create attributes for the new node
+    SymmCipher key;
+    AttrMap attrs;
+    string attrstring;
+    key.setkey((const byte*)samenode->nodekey().data(), samenode->type);
+    string sname = f->name;
+    LocalPath::utf8_normalize(&sname);
+    attrs.map['n'] = sname;
+    if (samenode->attrs.map.find('c') != samenode->attrs.map.end())
+    {
+        LOG_debug << "Node 'c' attribute found for deduplication: " << toNodeHandle(tc.nn[0].nodehandle);
+        attrs.map['c'] = samenode->attrs.map.at('c');
+    }
+    else
+    {
+        LOG_debug << "Node 'c' attribute NOT found for deduplication, serializing from fingerprint: " << toNodeHandle(tc.nn[0].nodehandle);
+        f->serializefingerprint(&attrs.map['c']);
+    }
+    attrs.getjson(&attrstring);
+    makeattr(&key, tc.nn[0].attrstring, attrstring.c_str());
+
+    // Debug: Log what we're about to send
+    LOG_debug << "Putnodes for deduplication: parent=" << toNodeHandle(f->h) 
+                << " filename=" << sname << " nodekey_size=" << tc.nn[0].nodekey.size()
+                << " nodehandle=" << toNodeHandle(tc.nn[0].nodehandle);
+
+    // Handle versioning if needed
+    if (tc.nn[0].type == FILENODE)
+    {
+        if (std::shared_ptr<Node> parent = nodeByHandle(f->h))
+        {
+            if (std::shared_ptr<Node> ovn = getovnode(parent.get(), &sname))
+            {
+                tc.nn[0].ovhandle = ovn->nodeHandle();
+                LOG_debug << "Setting ovhandle for versioning: " << toNodeHandle(ovn->nodeHandle());
+            }
+        }
+    }
+
+    // Submit the new node creation request
+    putnodes(f->h, UseLocalVersioningFlag, std::move(tc.nn), nullptr, tag, false);
+    return true;
+}
+
+
 // inject file into transfer subsystem
 // if file's fingerprint is not valid, it will be obtained from the local file
 // (PUT) or the file's key (GET)
@@ -18131,6 +18188,54 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
                 *cause = API_EREAD;
 
                 return false;
+            }
+
+            LOG_debug << "File's fingerprint: " << f->fingerprintDebugString();
+            std::shared_ptr<Node> samenode = mNodeManager.getNodeByFingerprint(*f);
+            if (samenode && samenode->nodekey().size())
+            {
+                LOG_debug << "Found file with same fingerprint: " << samenode->displayname();
+                // MAC verification for deduplication safety
+                // Use existing utility function to verify the local file matches the remote file's MAC
+                bool macVerified = false;
+                LocalPath localpath = f->getLocalname();
+                if (samenode->type == FILENODE && !localpath.empty())
+                {
+                    auto fa = fsaccess->newfileaccess();
+                    if (fa->fopen(localpath, true, false, FSLogging::logOnError))
+                    {
+                        // Use the existing utility function to compare MAC
+                        macVerified = CompareLocalFileMetaMacWithNode(fa.get(), samenode.get());
+                        if (macVerified)
+                        {
+                            LOG_info << "MAC verification successful for file deduplication: " << localpath.toPath(false);
+                        }
+                        else
+                        {
+                            LOG_warn << "MAC verification failed for fingerprint match - uploading file instead of copying: " << localpath.toPath(false);
+                        }
+                    }
+                    else
+                    {
+                        LOG_warn << "Cannot open local file for MAC verification: " << localpath.toPath(false);
+                    }
+                }
+
+                // If MAC verification succeeded, create a new node that references the same content
+                if (macVerified)
+                {
+                    LOG_debug << "Somenode having exactly the same MAC exists: " << samenode->displayname()
+                              << " - creating a new node that references the same content";
+                    copyRemoteFile(f, samenode, tag);
+                    *cause = API_OK;
+                    // Return early to skip the actual upload
+                    return true;
+                }
+                // Mac verification failed, pass through to upload file in full
+            }
+            else
+            {
+                LOG_debug << "No similar file with identical fingerprint is found.";
             }
 
 #ifdef USE_MEDIAINFO
