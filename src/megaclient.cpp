@@ -3064,6 +3064,15 @@ void MegaClient::exec()
                         {
                             pendingsc->purge(bytes);
                         }
+	                // If we are not back to normal, either the packet is imcomplete, or something gone wrong
+	                // Reset status
+                    	if (mScChunkedStatus != ScChunkedStatus::NotStarted)
+                        {
+                            LOG_warn << "SC chunked processing terminated for incomplete response data";
+	                    mScChunkedStatus = ScChunkedStatus::NotStarted;
+	                    pendingsc.reset();
+	                    break;
+                        }
                     }
                     // For traditional non-chunked processing, the whole buffer is used,
                     // for chunked processing, only the unprocessed part is used
