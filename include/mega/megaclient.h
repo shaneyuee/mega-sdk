@@ -1744,13 +1744,21 @@ private:
     {
         NotStarted,
         ProcessingAction,
-        ProcessingTElement
+        ProcessingTElement,
+        FinishedTElement, // backed from T-F array, but not finished one acction
     };
     ScChunkedStatus mScChunkedStatus = ScChunkedStatus::NotStarted;
     std::shared_ptr<Node> mScChunkedLastAPDeletedNode;
     bool mScChunkedFirstHandleMatchesDelete = false;
     bool mScChunkedFIsV2 = false;
     handle mScChunkedOriginatingUserHandle = UNDEF;
+    std::unique_lock<recursive_mutex>* mScNodeTreeIsChanging = nullptr;
+    bool mScOriginalAC = false;
+    int mScChunkedProcessBytes = 0;
+
+    // Pattern-based filter processing for actionpackets (f command approach)
+    std::map<std::string, std::function<bool(JSON*)>> mActionPacketFilters;
+    JSONSplitter mActionPacketSplitter;
 
     int mPendingCatchUps = 0;
     bool mReceivingCatchUp = false;
@@ -2458,6 +2466,23 @@ public:
     bool isSelfOriginatingAction(const char* json, nameid name);
     bool processActionPacket(const char* startpos);
     void processTElement(const char* startpos);
+    bool processNonInSCAPacket(JSON* json,
+            std::unique_lock<recursive_mutex>* nodeTreeIsChanging,
+            bool originalAC, bool &shouldreturn);
+
+    // Pattern-based filter processing methods for actionpackets
+    void initializeActionPacketFilters();
+    bool processActionPacketFromFilter(JSON* json);
+    bool processTActionFromFilter(JSON* json);
+    bool preprocessFArrayElement(JSON* json);
+    bool postprocessFArrayElement(JSON * json);
+    bool processNodeFromFArrayFilter(JSON* json);
+    bool processUserUpdateFromFilter(JSON* json);
+    bool processDeletionActionFromFilter(JSON* json);
+    bool processUpdateActionFromFilter(JSON* json);
+    bool processNewNodeActionFromFilter(JSON* json);
+    bool processShareActionFromFilter(JSON* json);
+    
     size_t procreqstat();
 
     // API warnings

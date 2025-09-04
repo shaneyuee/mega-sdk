@@ -3057,22 +3057,48 @@ void MegaClient::exec()
                     || (pendingsc->mChunked && pendingsc->size() > 0))
                 {
                     // If we are already in Chunked precessing, finish it
-                    if (pendingsc->mChunked && mScChunkedStatus != ScChunkedStatus::NotStarted)
+                    if (pendingsc->mChunked)
                     {
-                        int bytes = procscchunk();
-                        if (bytes > 0)
+                        if (mScChunkedStatus != ScChunkedStatus::NotStarted)
                         {
-                            pendingsc->purge(bytes);
+                            int bytes = procscchunk();
+                            if (bytes > 0)
+                            {
+                                mScChunkedProcessBytes += bytes;
+                                pendingsc->purge(bytes);
+                            }
+                            // If we are not back to normal, either the packet is imcomplete, or something gone wrong
+                            // Reset status
+                            if (mScChunkedStatus != ScChunkedStatus::NotStarted)
+                            {
+                                LOG_warn << "SC chunked processing terminated for incomplete response data";
+                                mScChunkedStatus = ScChunkedStatus::NotStarted;
+                            }
+                            jsonsc.pos = nullptr;
+                            pendingsc.reset();
+                            btsc.reset();
+                            mActionPacketSplitter.clear();
+                            mActionPacketFilters.clear();
+                            break;
                         }
-	                // If we are not back to normal, either the packet is imcomplete, or something gone wrong
-	                // Reset status
-                    	if (mScChunkedStatus != ScChunkedStatus::NotStarted)
+                        else
                         {
-                            LOG_warn << "SC chunked processing terminated for incomplete response data";
-	                    mScChunkedStatus = ScChunkedStatus::NotStarted;
-	                    pendingsc.reset();
-	                    break;
+                            if (*pendingsc->data() == '{')
+                            {
+                                mScChunkedProcessBytes = 0;
+                            }
+                            if (mScChunkedProcessBytes > 0)
+                            {
+                                jsonsc.pos = nullptr;
+                                pendingsc.reset();
+                                btsc.reset();
+                                mActionPacketSplitter.clear();
+                                mActionPacketFilters.clear();
+                                break;
+                            }
                         }
+                        mActionPacketSplitter.clear();
+                        mActionPacketFilters.clear();
                     }
                     // For traditional non-chunked processing, the whole buffer is used,
                     // for chunked processing, only the unprocessed part is used
@@ -3085,12 +3111,6 @@ void MegaClient::exec()
                         (pendingsc->mChunked && mScChunkedStatus == ScChunkedStatus::NotStarted && *jsonsc.pos == '{'))
                     {
                         jsonsc.enterobject();
-                    }
-
-                    if (pendingsc->mChunked)
-                    {
-                        // Note: For chunked mode, most processing should have already been done in REQ_INFLIGHT
-                        LOG_debug << "SC chunked processing completed";
                     }
 
                     app->notify_network_activity(NetworkActivityChannel::SC,
@@ -3244,18 +3264,12 @@ void MegaClient::exec()
                         // Process incoming chunks of actionpackets in real-time
                         if (availableBytes > 0)
                         {
-                            // Check if we need to initialize JSON processing
-                            if (!jsonsc.pos && pendingsc->bufpos > 10)
+                            LOG_warn << "Started real-time SC chunk processing";
+                            int bytes = procscchunk();
+                            if (bytes > 0)
                             {
-                                LOG_warn << "Started real-time SC chunk processing";
-                                int bytes = procscchunk();
-                                if (bytes > 0)
-                                {
-                                    pendingsc->purge(bytes);
-                                    app->notify_network_activity(NetworkActivityChannel::SC,
-                                                               NetworkActivityType::REQUEST_RECEIVED,
-                                                               API_OK);
-                                }
+                                mScChunkedProcessBytes += bytes;
+                                pendingsc->purge(bytes);
                             }
 
                             pendingsc->notifiedbufpos = pendingsc->bufpos;
@@ -5298,6 +5312,267 @@ void MegaClient::httprequest(const char *url, int method, bool binary, const cha
     }
 }
 
+// process the non-insca part of action packet
+bool MegaClient::processNonInSCAPacket(JSON* json, std::unique_lock<recursive_mutex>* nodeTreeIsChanging, bool originalAC, bool &shouldreturn)
+{
+    shouldreturn = false;
+    if (insca)
+        return true;
+
+    switch (json->getnameid())
+    {
+        case makeNameid("w"):
+            json->storeobject(&scnotifyurl);
+            break;
+
+        case makeNameid("ir"):
+            // when spoonfeeding is in action, there may still be more actionpackets to be delivered.
+            insca_notlast = json->getint() == 1;
+            break;
+
+        case makeNameid("sn"):
+            // the sn element is guaranteed to be the last in sequence (except for notification requests (c=50))
+            scsn.setScsn(json);
+            // At this point no CurrentSeqtag should be seen. mCurrentSeqtagSeen is set true
+            // when action package is processed and the seq tag matches with mCurrentSeqtag
+            assert(!mCurrentSeqtagSeen);
+            notifypurge();
+            if (sctable)
+            {
+                if (!pendingcs && !csretrying && !reqs.readyToSend())
+                {
+                    LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
+                    sctable->commit();
+                    sctable->begin();
+                    app->notify_dbcommit();
+                    pendingsccommit = false;
+                }
+                else
+                {
+                    LOG_debug << "Postponing DB commit until cs requests finish";
+                    pendingsccommit = true;
+                }
+            }
+            break;
+
+        case EOO:
+            if (!useralerts.isDeletedSharedNodesStashEmpty())
+            {
+                useralerts.purgeNodeVersionsFromStash();
+                useralerts.convertStashedDeletedSharedNodes();
+            }
+
+            LOG_debug << "Processing of action packets for " << string(sessionid, sizeof(sessionid)) << " finished.  More to follow: " << insca_notlast;
+            mergenewshares(1);
+            applykeys();
+            mNewKeyRepository.clear();
+
+            if (!statecurrent && !insca_notlast)   // with actionpacket spoonfeeding, just finishing a batch does not mean we are up to date yet - keep going while "ir":1
+            {
+                if (fetchingnodes)
+                {
+                    notifypurge();
+                    if (sctable)
+                    {
+                        LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
+                        sctable->commit();
+                        sctable->begin();
+                        pendingsccommit = false;
+                    }
+
+                    WAIT_CLASS::bumpds();
+                    fnstats.timeToResult = Waiter::ds - fnstats.startTime;
+                    fnstats.timeToCurrent = fnstats.timeToResult;
+
+                    fetchingnodes = false;
+                    restag = fetchnodestag;
+                    fetchnodestag = 0;
+
+                    if (!mBlockedSet && mCachedStatus.lookup(CacheableStatus::STATUS_BLOCKED, 0)) //block state not received in this execution, and cached says we were blocked last time
+                    {
+                        LOG_debug << "cached blocked states reports blocked, and no block state has been received before, issuing whyamiblocked";
+                        whyamiblocked();// lets query again, to trigger transition and restoreSyncs
+                    }
+
+                    enabletransferresumption();
+                    app->fetchnodes_result(API_OK);
+                    app->notify_dbcommit();
+                    fetchnodesAlreadyCompletedThisSession = true;
+
+                    WAIT_CLASS::bumpds();
+                    fnstats.timeToSyncsResumed = Waiter::ds - fnstats.startTime;
+
+                    if (!loggedIntoFolder())
+                    {
+                        // historic user alerts are not supported for public folders
+                        // now that we have fetched everything and caught up actionpackets since that state,
+                        // our next sc request can be for useralerts
+                        useralerts.begincatchup = true;
+                    }
+                }
+                else
+                {
+                    WAIT_CLASS::bumpds();
+                    fnstats.timeToCurrent = Waiter::ds - fnstats.startTime;
+                }
+                uint64_t numNodes = mNodeManager.getNodeCount();
+                fnstats.nodesCurrent = static_cast<long long>(numNodes);
+
+                if (mKeyManager.generation())
+                {
+                    // Clear in-use bit if needed for the shared nodes in ^!keys.
+                    mKeyManager.syncSharekeyInUseBit();
+                }
+
+                statecurrent = true;
+                app->nodes_current();
+                mFuseService.current();
+                LOG_debug << "Cloud node tree up to date";
+
+#ifdef ENABLE_SYNC
+                // Don't start sync activity until `statecurrent` as it could take actions based on old state
+                // The reworked sync code can figure out what to do once fully up to date.
+                if (nodeTreeIsChanging)
+                {
+                    nodeTreeIsChanging->unlock();
+                }
+                if (!syncsAlreadyLoadedOnStatecurrent)
+                {
+                    syncs.resumeSyncsOnStateCurrent();
+                    syncsAlreadyLoadedOnStatecurrent = true;
+                }
+#endif
+                if (tctable && cachedfiles.size())
+                {
+                    TransferDbCommitter committer(tctable);
+                    for (unsigned int i = 0; i < cachedfiles.size(); i++)
+                    {
+                        direction_t type = NONE;
+                        File* file = app->file_resume(&cachedfiles.at(i),
+                                                        &type,
+                                                        cachedfilesdbids.at(i));
+                        if (!file || (type != GET && type != PUT))
+                        {
+                            tctable->del(cachedfilesdbids.at(i));
+                            continue;
+                        }
+                        if (!startxfer(type, file, committer, false, false, false, UseLocalVersioningFlag, nullptr, nextreqtag()))  // TODO: should we have serialized these flags and restored them?
+                        {
+                            tctable->del(cachedfilesdbids.at(i));
+                            continue;
+                        }
+                    }
+                    cachedfiles.clear();
+                    cachedfilesdbids.clear();
+                }
+
+                WAIT_CLASS::bumpds();
+                fnstats.timeToTransfersResumed = Waiter::ds - fnstats.startTime;
+
+                string report;
+                fnstats.toJsonArray(&report);
+
+                sendevent(99426, report.c_str(), 0);    // Treeproc performance log
+
+                // NULL vector: "notify all elements"
+                app->nodes_updated(NULL, int(numNodes));
+                app->users_updated(NULL, int(users.size()));
+                app->pcrs_updated(NULL, int(pcrindex.size()));
+                app->sets_updated(nullptr, int(mSets.size()));
+                app->setelements_updated(nullptr, int(mSetElements.size()));
+#ifdef ENABLE_CHAT
+                app->chats_updated(NULL, int(chats.size()));
+#endif
+                app->useralerts_updated(nullptr, int(useralerts.alerts.size()));
+                mNodeManager.removeChanges();
+
+                // if ^!keys doesn't exist yet -> migrate the private keys from legacy attrs to ^!keys
+                if (loggedin() == FULLACCOUNT)
+                {
+                    if (!mKeyManager.generation())
+                    {
+                        assert(!mKeyManager.getPostRegistration());
+                        app->upgrading_security();
+                    }
+                    else
+                    {
+                        fetchContactsKeys();
+                        sc_pk();
+                    }
+                }
+            }
+
+            {
+                // In case a fetchnodes() occurs mid-session.  We should not allow
+                // the syncs to see the new tree unless we've caught up to at least
+                // the same scsn/seqTag as we were at before.  ir:1 is not always reliable
+                bool scTagNotCaughtUp =  !mScDbStateRecord.seqTag.empty() &&
+                                            !mLargestEverSeenScSeqTag.empty() &&
+                                            (mScDbStateRecord.seqTag.size() < mLargestEverSeenScSeqTag.size() ||
+                                            (mScDbStateRecord.seqTag.size() == mLargestEverSeenScSeqTag.size() &&
+                                            mScDbStateRecord.seqTag < mLargestEverSeenScSeqTag));
+
+                bool ac = statecurrent && !insca_notlast && !scTagNotCaughtUp;
+
+                if (!originalAC && ac)
+                {
+                    LOG_debug << clientname << "actionpacketsCurrent is true again";
+
+                }
+                actionpacketsCurrent = ac;
+            }
+
+            if (!insca_notlast)
+            {
+                if (mReceivingCatchUp)
+                {
+                    mReceivingCatchUp = false;
+                    mPendingCatchUps--;
+                    LOG_debug << "catchup complete. Still pending: " << mPendingCatchUps;
+                    app->catchup_result();
+                }
+            }
+
+            if (pendingsccommit && sctable && !reqs.cmdsInflight() && scsn.ready())
+            {
+                LOG_debug << "Executing postponed DB commit 1";
+                sctable->commit();
+                sctable->begin();
+                app->notify_dbcommit();
+                pendingsccommit = false;
+            }
+
+            if (pendingsccommit)
+            {
+                LOG_debug << "Postponing DB commit until cs requests finish (spoonfeeding)";
+            }
+
+#ifdef ENABLE_SYNC
+            syncs.waiter->notify();
+#endif
+
+            shouldreturn = true;
+            return true;
+
+        case makeNameid("a"):
+            if (json->enterarray())
+            {
+                LOG_debug << "Processing action packets for " << string(sessionid, sizeof(sessionid));
+                insca = true;
+                break;
+            }
+            // fall through
+        default:
+            if (!json->storeobject())
+            {
+                LOG_err << "Error parsing sc request";
+                shouldreturn = true;
+                return true;
+            }
+    }
+    return true;
+}
+
 // process server-client request
 bool MegaClient::procsc()
 {
@@ -5315,252 +5590,12 @@ bool MegaClient::procsc()
     {
         if (!insca)
         {
-            switch (jsonsc.getnameid())
+            bool shouldreturn = false;
+            auto result = processNonInSCAPacket(&jsonsc,
+                    &nodeTreeIsChanging, originalAC, shouldreturn);
+            if (shouldreturn)
             {
-                case makeNameid("w"):
-                    jsonsc.storeobject(&scnotifyurl);
-                    break;
-
-                case makeNameid("ir"):
-                    // when spoonfeeding is in action, there may still be more actionpackets to be delivered.
-                    insca_notlast = jsonsc.getint() == 1;
-                    break;
-
-                case makeNameid("sn"):
-                    // the sn element is guaranteed to be the last in sequence (except for notification requests (c=50))
-                    scsn.setScsn(&jsonsc);
-                    // At this point no CurrentSeqtag should be seen. mCurrentSeqtagSeen is set true
-                    // when action package is processed and the seq tag matches with mCurrentSeqtag
-                    assert(!mCurrentSeqtagSeen);
-                    notifypurge();
-                    if (sctable)
-                    {
-                        if (!pendingcs && !csretrying && !reqs.readyToSend())
-                        {
-                            LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
-                            sctable->commit();
-                            sctable->begin();
-                            app->notify_dbcommit();
-                            pendingsccommit = false;
-                        }
-                        else
-                        {
-                            LOG_debug << "Postponing DB commit until cs requests finish";
-                            pendingsccommit = true;
-                        }
-                    }
-                    break;
-
-                case EOO:
-                    if (!useralerts.isDeletedSharedNodesStashEmpty())
-                    {
-			useralerts.purgeNodeVersionsFromStash();
-                        useralerts.convertStashedDeletedSharedNodes();
-                    }
-
-
-                    LOG_debug << "Processing of action packets for " << string(sessionid, sizeof(sessionid)) << " finished.  More to follow: " << insca_notlast;
-                    mergenewshares(1);
-                    applykeys();
-                    mNewKeyRepository.clear();
-
-                    if (!statecurrent && !insca_notlast)   // with actionpacket spoonfeeding, just finishing a batch does not mean we are up to date yet - keep going while "ir":1
-                    {
-                        if (fetchingnodes)
-                        {
-                            notifypurge();
-                            if (sctable)
-                            {
-                                LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
-                                sctable->commit();
-                                sctable->begin();
-                                pendingsccommit = false;
-                            }
-
-                            WAIT_CLASS::bumpds();
-                            fnstats.timeToResult = Waiter::ds - fnstats.startTime;
-                            fnstats.timeToCurrent = fnstats.timeToResult;
-
-                            fetchingnodes = false;
-                            restag = fetchnodestag;
-                            fetchnodestag = 0;
-
-                            if (!mBlockedSet && mCachedStatus.lookup(CacheableStatus::STATUS_BLOCKED, 0)) //block state not received in this execution, and cached says we were blocked last time
-                            {
-                                LOG_debug << "cached blocked states reports blocked, and no block state has been received before, issuing whyamiblocked";
-                                whyamiblocked();// lets query again, to trigger transition and restoreSyncs
-                            }
-
-                            enabletransferresumption();
-                            app->fetchnodes_result(API_OK);
-                            app->notify_dbcommit();
-                            fetchnodesAlreadyCompletedThisSession = true;
-
-                            WAIT_CLASS::bumpds();
-                            fnstats.timeToSyncsResumed = Waiter::ds - fnstats.startTime;
-
-                            if (!loggedIntoFolder())
-                            {
-                                // historic user alerts are not supported for public folders
-                                // now that we have fetched everything and caught up actionpackets since that state,
-                                // our next sc request can be for useralerts
-                                useralerts.begincatchup = true;
-                            }
-                        }
-                        else
-                        {
-                            WAIT_CLASS::bumpds();
-                            fnstats.timeToCurrent = Waiter::ds - fnstats.startTime;
-                        }
-                        uint64_t numNodes = mNodeManager.getNodeCount();
-                        fnstats.nodesCurrent = static_cast<long long>(numNodes);
-
-                        if (mKeyManager.generation())
-                        {
-                            // Clear in-use bit if needed for the shared nodes in ^!keys.
-                            mKeyManager.syncSharekeyInUseBit();
-                        }
-
-                        statecurrent = true;
-                        app->nodes_current();
-                        mFuseService.current();
-                        LOG_debug << "Cloud node tree up to date";
-
-#ifdef ENABLE_SYNC
-                        // Don't start sync activity until `statecurrent` as it could take actions based on old state
-                        // The reworked sync code can figure out what to do once fully up to date.
-                        nodeTreeIsChanging.unlock();
-                        if (!syncsAlreadyLoadedOnStatecurrent)
-                        {
-                            syncs.resumeSyncsOnStateCurrent();
-                            syncsAlreadyLoadedOnStatecurrent = true;
-                        }
-#endif
-                        if (tctable && cachedfiles.size())
-                        {
-                            TransferDbCommitter committer(tctable);
-                            for (unsigned int i = 0; i < cachedfiles.size(); i++)
-                            {
-                                direction_t type = NONE;
-                                File* file = app->file_resume(&cachedfiles.at(i),
-                                                              &type,
-                                                              cachedfilesdbids.at(i));
-                                if (!file || (type != GET && type != PUT))
-                                {
-                                    tctable->del(cachedfilesdbids.at(i));
-                                    continue;
-                                }
-                                if (!startxfer(type, file, committer, false, false, false, UseLocalVersioningFlag, nullptr, nextreqtag()))  // TODO: should we have serialized these flags and restored them?
-                                {
-                                    tctable->del(cachedfilesdbids.at(i));
-                                    continue;
-                                }
-                            }
-                            cachedfiles.clear();
-                            cachedfilesdbids.clear();
-                        }
-
-                        WAIT_CLASS::bumpds();
-                        fnstats.timeToTransfersResumed = Waiter::ds - fnstats.startTime;
-
-                        string report;
-                        fnstats.toJsonArray(&report);
-
-                        sendevent(99426, report.c_str(), 0);    // Treeproc performance log
-
-                        // NULL vector: "notify all elements"
-                        app->nodes_updated(NULL, int(numNodes));
-                        app->users_updated(NULL, int(users.size()));
-                        app->pcrs_updated(NULL, int(pcrindex.size()));
-                        app->sets_updated(nullptr, int(mSets.size()));
-                        app->setelements_updated(nullptr, int(mSetElements.size()));
-#ifdef ENABLE_CHAT
-                        app->chats_updated(NULL, int(chats.size()));
-#endif
-                        app->useralerts_updated(nullptr, int(useralerts.alerts.size()));
-                        mNodeManager.removeChanges();
-
-                        // if ^!keys doesn't exist yet -> migrate the private keys from legacy attrs to ^!keys
-                        if (loggedin() == FULLACCOUNT)
-                        {
-                            if (!mKeyManager.generation())
-                            {
-                                assert(!mKeyManager.getPostRegistration());
-                                app->upgrading_security();
-                            }
-                            else
-                            {
-                                fetchContactsKeys();
-                                sc_pk();
-                            }
-                        }
-                    }
-
-                    {
-                        // In case a fetchnodes() occurs mid-session.  We should not allow
-                        // the syncs to see the new tree unless we've caught up to at least
-                        // the same scsn/seqTag as we were at before.  ir:1 is not always reliable
-                        bool scTagNotCaughtUp =  !mScDbStateRecord.seqTag.empty() &&
-                                                 !mLargestEverSeenScSeqTag.empty() &&
-                                                 (mScDbStateRecord.seqTag.size() < mLargestEverSeenScSeqTag.size() ||
-                                                  (mScDbStateRecord.seqTag.size() == mLargestEverSeenScSeqTag.size() &&
-                                                  mScDbStateRecord.seqTag < mLargestEverSeenScSeqTag));
-
-                        bool ac = statecurrent && !insca_notlast && !scTagNotCaughtUp;
-
-                        if (!originalAC && ac)
-                        {
-                            LOG_debug << clientname << "actionpacketsCurrent is true again";
-
-                        }
-                        actionpacketsCurrent = ac;
-                    }
-
-                    if (!insca_notlast)
-                    {
-                        if (mReceivingCatchUp)
-                        {
-                            mReceivingCatchUp = false;
-                            mPendingCatchUps--;
-                            LOG_debug << "catchup complete. Still pending: " << mPendingCatchUps;
-                            app->catchup_result();
-                        }
-                    }
-
-                    if (pendingsccommit && sctable && !reqs.cmdsInflight() && scsn.ready())
-                    {
-                        LOG_debug << "Executing postponed DB commit 1";
-                        sctable->commit();
-                        sctable->begin();
-                        app->notify_dbcommit();
-                        pendingsccommit = false;
-                    }
-
-                    if (pendingsccommit)
-                    {
-                        LOG_debug << "Postponing DB commit until cs requests finish (spoonfeeding)";
-                    }
-
-#ifdef ENABLE_SYNC
-                    syncs.waiter->notify();
-#endif
-
-                    return true;
-
-                case makeNameid("a"):
-                    if (jsonsc.enterarray())
-                    {
-                        LOG_debug << "Processing action packets for " << string(sessionid, sizeof(sessionid));
-                        insca = true;
-                        break;
-                    }
-                    // fall through
-                default:
-                    if (!jsonsc.storeobject())
-                    {
-                        LOG_err << "Error parsing sc request";
-                        return true;
-                    }
+                return result;
             }
         }
 
@@ -5575,6 +5610,12 @@ bool MegaClient::procsc()
     }
 }
 
+static void breakme(const char *action, const char *chunk)
+{
+    std::cout << "Breaking at <" << action << ">: " << string(chunk).substr(0, 20) << std::endl;
+    // This function is a placeholder for breaking in gdb
+}
+
 // process server-client request in chunked mode
 // return the number of bytes processed
 int MegaClient::procscchunk()
@@ -5582,271 +5623,567 @@ int MegaClient::procscchunk()
     // non-chunked mode, do nothing
     if (!pendingsc->mChunked)
     {
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
         return 0;
     }
 
-    int processbytes = 0;
+    m_off_t processed = 0;
+    bool start = !jsonsc.pos;
+    auto chunk = pendingsc->data();
+    jsonsc.begin(chunk);
 
-    if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+    if (start)
     {
-        if (pendingsc->in.size() < 100) // not enough data yet
+        // Initialize action packet filters on first call (pattern matching approach)
+        if (mActionPacketFilters.empty())
         {
-            return 0;
+            initializeActionPacketFilters();
         }
-        // Not "a" nameid, will not be processed in chunked mode
-        if (pendingsc->in.compare(0, 6, "{\"a\":[") != 0)
-        {
-            LOG_warn << "Skipping non action packet, json: " << pendingsc->in;
-            return 0;
-        }
-        mScChunkedStatus = ScChunkedStatus::ProcessingAction;
-        jsonsc.pos = pendingsc->in.data()+6; // enter into actionpackets array
-        processbytes += 6;
-
-        // Initialize JSON processing for chunked server-client data
-        insca = false;
-        insca_notlast = false;
-        mScChunkedLastAPDeletedNode.reset();
+        assert(mActionPacketSplitter.isStarting());
     }
     else
     {
-        // Start from data(), not including perged content
-        jsonsc.pos = pendingsc->data();
+        if (mActionPacketFilters.empty())
+        {
+            LOG_err << "ActionPacket filters not initialized, probably failed from previous chunk, please check logs.";
+            mActionPacketSplitter.clear();
+            mActionPacketFilters.clear();
+            return 0;
+        }
     }
 
-    // keep previous position
-    const char *prevpos = jsonsc.pos;
+    // Process the chunk using streaming JSON splitter with filters
+    processed += mActionPacketSplitter.processChunk(&mActionPacketFilters, chunk);
 
-    for(;;)
+    // Check for processing completion or errors
+    if (mActionPacketSplitter.hasFailed())
     {
+        breakme("F", chunk);
+        LOG_err << "ActionPacket JSON processing failed";
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
+        return 0;
+    }
+
+    if (mActionPacketSplitter.hasFinished())
+    {
+        LOG_debug << "ActionPacket JSON processing completed";
+        if (!jsonsc.leavearray())
+        {
+            LOG_err << "Unexpected end of JSON stream: " << jsonsc.pos;
+            mActionPacketSplitter.clear();
+            mActionPacketFilters.clear();
+            assert(false);
+            return 0;
+        }
+        else
+        {
+            processed++;
+        }
+        assert(!chunk[processed]);
+        // Reset for next round
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
+        insca = false;
+    }
+
+    return static_cast<int>(processed);
+}
+
+void MegaClient::initializeActionPacketFilters()
+{
+    LOG_debug << "Initializing ActionPacket filters for pattern matching";
+
+    // Clear any existing filters
+    mActionPacketFilters.clear();
+
+    // Filter for chunk processing start
+    mActionPacketFilters.emplace("<", [this](JSON *json)
+    {
+        breakme("<", json->pos);
+        LOG_debug << "ActionPacket chunk processing started";
+        if (mScNodeTreeIsChanging)
+        {
+            delete mScNodeTreeIsChanging;
+        }
+        mScNodeTreeIsChanging = new std::unique_lock<recursive_mutex>(nodeTreeMutex);
+        mScOriginalAC = actionpacketsCurrent;
+        actionpacketsCurrent = false;
+        mScChunkedStatus = ScChunkedStatus::NotStarted;
+        return true;
+    });
+
+    // Filter for chunk processing completion
+    mActionPacketFilters.emplace(">", [this](JSON *json)
+    {
+        breakme(">", json->pos);
+        LOG_debug << "ActionPacket chunk processing completed";
+        mScChunkedStatus = ScChunkedStatus::NotStarted;
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
+        return true;
+    });
+
+    // Filter for actionpacket array start
+    mActionPacketFilters.emplace("{a[", [this](JSON *json)
+    {
+        breakme("{a[", json->pos);
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+        {
+            if (strncmp(json->pos, "{\"a\":[", 6) == 0)
+            {
+                json->pos += 6; // go to start of A array element
+            }
+        }
+        LOG_debug << "ActionPacket array processing started";
+        return true;
+    });
+
+    // Filter for individual actionpackets within array
+    mActionPacketFilters.emplace("{[a{", [this](JSON *json) // c
+    {
+        breakme("{[a{", json->pos);
+        LOG_debug << "Processing individual actionpacket";
+        return processActionPacketFromFilter(json);
+    });
+
+    // Filter for "f" array elements within "t" action
+    mActionPacketFilters.emplace("{[a{{t[f{", [this](JSON *json) // c
+    {
+        breakme("{[a{{t[f{", json->pos);
+        LOG_debug << "Processing node from 'f' array";
+        mScChunkedFIsV2 = false;
+        return processNodeFromFArrayFilter(json);
+    });
+
+    // Filter for "f2" array elements within "t" action (versioned nodes)
+    mActionPacketFilters.emplace("{[a{{t[f2{", [this](JSON *json) // c
+    {
+        breakme("{[a{{t[f2{", json->pos);
+        LOG_debug << "Processing versioned node from 'f2' array";
+        mScChunkedFIsV2 = true;
+        return processNodeFromFArrayFilter(json);
+    });
+
+    mActionPacketFilters.emplace("{", [this](JSON *json)
+    {
+        breakme("{", json->pos);
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+        {
+        }
         if (mScChunkedStatus == ScChunkedStatus::ProcessingAction)
         {
-            LOG_warn << "SC chunk entering ActionPacket processing.";
-            // Process all the actionpackets in the array
-            while (jsonsc.enterobject())
+            for(;!insca;)
             {
-                const char *packetStart = --jsonsc.pos; // back to '{'
-                
-                // Check completeness of an action packet
-                if (jsonsc.storeobject())
+                bool shouldreturn = false;
+                processNonInSCAPacket(json,
+                        mScNodeTreeIsChanging, mScOriginalAC, shouldreturn);
+                if (shouldreturn)
                 {
-                    // Process this complete actionpacket
-                    processActionPacket(packetStart);
-                    processbytes += jsonsc.pos - prevpos;
-                    prevpos = jsonsc.pos;
-                    
-                    // Skip comma if present
-                    if (*jsonsc.pos == ',')
-                    {
-                        jsonsc.pos++;
-                        processbytes++;
-                        prevpos = jsonsc.pos;
-                    }
-                }
-                else
-                {
-                    // Incomplete action packet, break and wait for more data
-                    jsonsc.pos = prevpos;
                     break;
                 }
             }
-            
-            // Check if we've reached a "t" action that contains an "f" array
-            // This requires special handling for large node listings
-            if (jsonsc.pos < pendingsc->in.data() + pendingsc->in.size() - 10)
+            mScChunkedStatus = ScChunkedStatus::NotStarted;
+            if (mScNodeTreeIsChanging)
             {
-                const char* checkPos = jsonsc.pos;
-                if (*checkPos == '{' && strncmp(checkPos, "{\"a\":\"t\"", 8) == 0)
-                {
-                    // Look ahead to see if this "t" action has an "f" array
-                    JSON tempJson;
-                    tempJson.begin(checkPos);
-                    tempJson.pos = checkPos;
-
-                    if (tempJson.enterobject())
-                    {
-                        for (;;)
-                        {
-                            auto name = tempJson.getnameid();
-                            auto objectpos = tempJson.pos;
-                            switch (name)
-                            {
-                            case makeNameid("t"):
-                                if (tempJson.enterobject())
-                                {
-                                    mScChunkedFIsV2 = false;
-                                    for (;;)
-                                    {
-                                        switch (tempJson.getnameid())
-                                        {
-                                            case makeNameid("f2"):
-                                                mScChunkedFIsV2 = true;
-                                                // fall through
-                                            case makeNameid("f"):
-                                                if (tempJson.enterarray())
-                                                {
-                                                    mScChunkedStatus = ScChunkedStatus::ProcessingTElement;
-                                                    jsonsc.pos = tempJson.pos; // Position at start of f array
-                                                    processbytes += jsonsc.pos - prevpos;
-                                                    prevpos = jsonsc.pos;
-                                                    mScChunkedFirstHandleMatchesDelete = false;
-                                                }
-                                                // fall through
-                                            case EOO:
-                                                goto exit_main_loop;
-
-                                            default:
-                                                if(!tempJson.storeobject())
-                                                {
-                                                    goto exit_main_loop;
-                                                }
-                                                break;
-                                        }
-                                    }
-                                }
-                                // fall through
-                            case EOO:
-                                goto exit_main_loop;
-
-                            default:
-                                if(!tempJson.storeobject())
-                                {
-                                    goto exit_main_loop; // Incomplete, wait for more data
-                                }
-
-                                // Process other elements
-                                switch(name)
-                                {
-                                case name_id::u:
-                                    tempJson.pos = objectpos;
-                                    readusers(&tempJson, true);
-                                    break;
-                                case makeNameid("ou"):
-                                    tempJson.pos = objectpos;
-                                    mScChunkedOriginatingUserHandle = tempJson.gethandle(USERHANDLE);
-                                    break;
-                                }
-                                break;
-                            }
-                        }
-                        exit_main_loop:;
-                    }
-                }
+                delete mScNodeTreeIsChanging;
+                mScNodeTreeIsChanging = nullptr;
             }
-
-            // Check if we've reached the end of the f array
-            if (*jsonsc.pos == ']')
-            {
-                LOG_warn << "SC chunk back from ActionPacket to normal.";
-                jsonsc.pos++; // skip ']'
-                processbytes++;
-                prevpos = jsonsc.pos;
-                mScChunkedStatus = ScChunkedStatus::NotStarted; // Return to normal processing
-                // No more Actions Packets. Force it to advance and process all the remaining
-                // command responses until a new "st" is found, if any.
-                // It will also process the latest command response associated (by the Sequence Tag)
-                // with the latest AP processed here.
-                sc_checkSequenceTag(string());
-                insca = false;
-            }
+            app->notify_network_activity(NetworkActivityChannel::SC,
+                                         NetworkActivityType::REQUEST_RECEIVED,
+                                         API_OK);
         }
+        return true;
+    });
 
+    // Filter for error handling
+    mActionPacketFilters.emplace("E", [this](JSON *json)
+    {
+        breakme("E", json->pos);
+        LOG_err << "Error processing actionpacket chunk: " << json->pos;
+        return false;
+    });
+
+    LOG_debug << "ActionPacket filters initialized: " << mActionPacketFilters.size() << " filters";
+}
+
+// Helper functions for pattern-based filter processing
+// callback for "{[a{"
+bool MegaClient::processActionPacketFromFilter(JSON* json)
+{
+    try
+    {
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+        {
+            LOG_debug << "ActionPacket individual processing started";
+            // Initialize JSON processing for chunked server-client data
+            insca = false;
+            insca_notlast = false;
+            mScChunkedLastAPDeletedNode.reset();
+            mScChunkedStatus = ScChunkedStatus::ProcessingAction;
+        }
         if (mScChunkedStatus == ScChunkedStatus::ProcessingTElement)
         {
-            LOG_warn << "SC chunk entering T-Element processing.";
-            // Process elements from the "f" array of a "t" action
-            while (jsonsc.enterobject())
+            LOG_debug << "Finishing 't' element processing, pos: " << std::string(json->pos).substr(0, 20);
+            if (strncmp(json->pos, "]}", 2) == 0)
             {
-                --jsonsc.pos; // back to '{'
-
-                std::string tree;
-                if (jsonsc.storeobject(&tree)) // Check to completeness of element
+                json->pos += 2; // Move past "]}"
+                LOG_debug << "Finishing 'f' array processing";
+                if (postprocessFArrayElement(json))
                 {
-                    processbytes += jsonsc.pos - prevpos;
-                    prevpos = jsonsc.pos;
-
-                    // Reconstruct the full t element
-                    string f = mScChunkedFIsV2? "f2" : "f";
-                    tree = "{\"" + f + "\":[" + tree + "]}";
-
-                    // Process this complete t element
-                    processTElement(tree.c_str());
-                    jsonsc.pos = prevpos;
-
-                    // Skip comma if present
-                    if (*jsonsc.pos == ',')
-                    {
-                        jsonsc.pos++;
-                        processbytes++;
-                        prevpos = jsonsc.pos;
-                    }
+                    mScChunkedStatus = ScChunkedStatus::ProcessingAction;
+                    return true;
                 }
-                else
-                {
-                    // Incomplete element, break and wait for more data
-                    jsonsc.pos = prevpos;
-                    break;
-                }
+                LOG_err << "Error postprocessing 'f' array: " << json->pos;
+                return false;
             }
-            
-            // Check if we've reached the end of the f array
-            if (*jsonsc.pos == ']' && *(jsonsc.pos +1) == '}')
-            {
-                // Check the completeness of the rest, find the ending '}'
-                JSON tmpJ;
-                auto endingpos = jsonsc.pos + 2;
-                tmpJ.begin(endingpos);
-                tmpJ.pos = endingpos;
-                while(tmpJ.getnameid() != EOO)
-                {
-                    if (!tmpJ.storeobject())
-                    {
-                        // Incomplete, wait for more data
-                        return processbytes;
-                    }
-                }
-                if (tmpJ.leaveobject()) // Finished ActionPacket with '}'
-                {
-                    LOG_warn << "SC chunk back from T-Element to ActionPacket.";
-                    processbytes += tmpJ.pos - jsonsc.pos;
-                    jsonsc.pos = tmpJ.pos;
-                    prevpos = jsonsc.pos;
+        }
+        if (mScChunkedStatus != ScChunkedStatus::ProcessingAction)
+        {
+            LOG_err << "Unexpected state for processing individual actionpacket: " << static_cast<int>(mScChunkedStatus);
+            return false;
+        }
+        // Process complete actionpacket using existing logic
+        bool result = processActionPacket(json->pos);
+        if (result)
+        {
+            json->storeobject();
+            return true;
+        }
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing actionpacket: " << e.what();
+        return false;
+    }
+}
 
-                    // Process the rest of elements
-                    tmpJ.pos = endingpos;
-                    nameid name;
-                    while((name = tmpJ.getnameid()) != EOO)
+bool MegaClient::processTActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Enter the "t" action object
+        if (!json->enterobject())
+        {
+            return false;
+        }
+
+        bool foundF = false;
+        mScChunkedFIsV2 = false;
+
+        for (;;)
+        {
+            auto name = json->getnameid();
+            auto objectpos = json->pos;
+
+            switch (name)
+            {
+            case makeNameid("t"):
+                if (json->enterobject())
+                {
+                    for (;;)
                     {
-                        switch(name)
+                        switch (json->getnameid())
                         {
-                        case name_id::u:
-                            readusers(&tmpJ, true);
+                        case makeNameid("f2"):
+                            mScChunkedFIsV2 = true;
+                            // fall through
+                        case makeNameid("f"):
+                            if (json->enterarray())
+                            {
+                                mScChunkedStatus = ScChunkedStatus::ProcessingTElement;
+                                foundF = true;
+                                // The JSONSplitter will handle processing individual elements
+                                return true;
+                            }
                             break;
-                        case makeNameid("ou"):
-                            mScChunkedOriginatingUserHandle = tmpJ.gethandle(USERHANDLE);
-                            break;
+                        case EOO:
+                            json->leaveobject();
+                            goto exit_t_loop;
                         default:
-                            tmpJ.storeobject();
+                            if (!json->storeobject())
+                            {
+                                return false;
+                            }
                             break;
                         }
                     }
-
-                    // Change status and clean up T action
-                    mScChunkedStatus = ScChunkedStatus::ProcessingAction; // Return to processing actions
-                    mergenewshares(1);
-                    if (!loggedIntoFolder())
-                        useralerts.convertNotedSharedNodes(true, mScChunkedOriginatingUserHandle);
-                    mScChunkedLastAPDeletedNode = nullptr;
-
-                    // Continue to ProcessingAction
-                    continue;
                 }
+                break;
+
+            case name_id::u:
+                json->pos = objectpos;
+                readusers(json, true);
+                break;
+
+            case makeNameid("ou"):
+                json->pos = objectpos;
+                mScChunkedOriginatingUserHandle = json->gethandle(USERHANDLE);
+                break;
+
+            case EOO:
+                json->leaveobject();
+                return true;
+
+            default:
+                if (!json->storeobject())
+                {
+                    return false;
+                }
+                break;
             }
         }
-        break;
-    }
+        exit_t_loop:
 
-    return processbytes;
+        return foundF;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing 't' action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::preprocessFArrayElement(JSON* json)
+{
+    auto startpos = json->pos;
+    try
+    {
+        if (strncmp(json->pos, "{\"a\":\"t\"", 8))
+        {
+            // Not a 't' action, skip preprocessing
+            return false;
+        }
+
+        json->pos += 8; // Move past {"a":"t"
+
+        // Process each element in the 'a' array
+        for (;;)
+        {
+            auto name = json->getnameid();
+            auto objectpos = json->pos;
+            switch (name)
+            {
+            case makeNameid("t"):
+                json->enterobject();
+                if (strncmp(json->pos, "\"f\":[", 5) == 0)
+                {
+                    json->pos += 5; // Move past "f":[
+                    return true;
+                }
+                if (strncmp(json->pos, "\"f2\":[", 6) == 0)
+                {
+                    json->pos += 6; // Move past "f2":[
+                    return true;
+                }
+                LOG_err << "Unexpected 't' object structure";
+                goto exit_main_loop;
+            case name_id::u:
+                json->pos = objectpos;
+                readusers(json, true);
+                break;
+            case makeNameid("ou"):
+                json->pos = objectpos;
+                mScChunkedOriginatingUserHandle = json->gethandle(USERHANDLE);
+                break;
+            case EOO:
+                goto exit_main_loop;
+            default:
+                if(!json->storeobject())
+                {
+                    goto exit_main_loop; // Incomplete, wait for more data
+                }
+                break;
+            }
+        }
+        exit_main_loop:
+        LOG_err << "Incomplete packet detected, should not happen!";
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error preprocessing 'f' array element: " << e.what();
+    }
+    json->pos = startpos;
+    return false;
+}
+
+bool MegaClient::postprocessFArrayElement(JSON* json)
+{
+    auto startpos = json->pos;
+    try
+    {
+        // Process each element in the 'a' array
+        for (;;)
+        {
+            auto name = json->getnameid();
+            auto objectpos = json->pos;
+            switch (name)
+            {
+            case makeNameid("t"):
+                LOG_err << "Unexpected 't' object in post stage!";
+                goto exit_main_loop;
+            case name_id::u:
+                json->pos = objectpos;
+                readusers(json, true);
+                break;
+            case makeNameid("ou"):
+                json->pos = objectpos;
+                mScChunkedOriginatingUserHandle = json->gethandle(USERHANDLE);
+                break;
+            case EOO:
+                if (json->leaveobject())
+                {
+                    return true;
+                }
+                goto exit_main_loop;
+            default:
+                if(!json->storeobject())
+                {
+                    goto exit_main_loop; // Incomplete, wait for more data
+                }
+                break;
+            }
+        }
+        exit_main_loop:
+        LOG_err << "Incomplete packet detected, should not happen!";
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error finishing 'f' array: " << e.what();
+    }
+    json->pos = startpos;
+    return false;
+}
+
+
+bool MegaClient::processNodeFromFArrayFilter(JSON* json)
+{
+    try
+    {
+        // Save current position
+        const char* nodeStart = json->pos;
+        LOG_debug << "NodeFromFArray JSON starts at: " << nodeStart;
+
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted ||
+            mScChunkedStatus == ScChunkedStatus::ProcessingAction)
+        {
+            LOG_debug << "ActionPacket 'f' element processing started";
+            if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+            {
+                // Initialize JSON processing for chunked server-client data
+                insca = false;
+                insca_notlast = false;
+                mScChunkedLastAPDeletedNode.reset();
+                mScChunkedStatus = ScChunkedStatus::ProcessingAction;
+            }
+            if (strncmp(json->pos, "{\"a\":[", 6) == 0)
+            {
+                json->pos += 6; // go to start of {"a":[
+            }
+            if (strncmp(json->pos, "{\"a\":\"t\"", 8) == 0)
+            {
+                auto result = preprocessFArrayElement(json);
+                if (!result)
+                {
+                    return false;
+                }
+            }
+            mScChunkedStatus = ScChunkedStatus::ProcessingTElement;
+        }
+        assert(mScChunkedStatus == ScChunkedStatus::ProcessingTElement);
+
+        assert(json->enterobject());
+
+        // Store the complete node object
+        std::string nodeJson;
+        --json->pos; // back to {
+        assert(json->storeobject(&nodeJson));
+
+        // Reconstruct the full t element for processing
+        string f = mScChunkedFIsV2 ? "f2" : "f";
+        string fullElement = "{\"" + f + "\":[" + nodeJson + "]}";
+
+        // Process this complete t element using existing logic
+        processTElement(fullElement.c_str());
+
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing node from f array: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processUserUpdateFromFilter(JSON* json)
+{
+    try
+    {
+        return readusers(json, true) == 1;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing user update: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processDeletionActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process deletion action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing deletion action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processUpdateActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process update/move action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing update action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processNewNodeActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process new node action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing new node action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processShareActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process share action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing share action: " << e.what();
+        return false;
+    }
 }
 
 bool MegaClient::isSelfOriginatingAction(const char *json, nameid name)
