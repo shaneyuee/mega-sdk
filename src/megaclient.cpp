@@ -50,6 +50,7 @@
 
 #ifdef __ANDROID__
 #include "mega/android/androidFileSystem.h"
+#include "megaclient.h"
 #endif
 
 namespace mega {
@@ -3052,12 +3053,66 @@ void MegaClient::exec()
                     break;
                 }
 
-                if (*pendingsc->in.c_str() == '{')
+                if ((!pendingsc->mChunked && *pendingsc->in.c_str() == '{')
+                    || (pendingsc->mChunked && pendingsc->size() > 0))
                 {
+                    // If we are already in Chunked precessing, finish it
+                    if (pendingsc->mChunked)
+                    {
+                        if (mScChunkedStatus != ScChunkedStatus::NotStarted)
+                        {
+                            int bytes = procscchunk();
+                            if (bytes > 0)
+                            {
+                                mScChunkedProcessBytes += bytes;
+                                pendingsc->purge(bytes);
+                            }
+                            // If we are not back to normal, either the packet is imcomplete, or something gone wrong
+                            // Reset status
+                            if (mScChunkedStatus != ScChunkedStatus::NotStarted)
+                            {
+                                LOG_warn << "SC chunked processing terminated for incomplete response data";
+                                mScChunkedStatus = ScChunkedStatus::NotStarted;
+                            }
+                            jsonsc.pos = nullptr;
+                            pendingsc.reset();
+                            btsc.reset();
+                            mActionPacketSplitter.clear();
+                            mActionPacketFilters.clear();
+                            break;
+                        }
+                        else
+                        {
+                            if (*pendingsc->data() == '{')
+                            {
+                                mScChunkedProcessBytes = 0;
+                            }
+                            if (mScChunkedProcessBytes > 0)
+                            {
+                                jsonsc.pos = nullptr;
+                                pendingsc.reset();
+                                btsc.reset();
+                                mActionPacketSplitter.clear();
+                                mActionPacketFilters.clear();
+                                break;
+                            }
+                        }
+                        mActionPacketSplitter.clear();
+                        mActionPacketFilters.clear();
+                    }
+                    // For traditional non-chunked processing, the whole buffer is used,
+                    // for chunked processing, only the unprocessed part is used
+                    auto data = pendingsc->mChunked? pendingsc->data(): pendingsc->in.c_str();
                     insca = false;
                     insca_notlast = false;
-                    jsonsc.begin(pendingsc->in.c_str());
-                    jsonsc.enterobject();
+                    jsonsc.begin(data);
+                    // Enter only when first started
+                    if (!pendingsc->mChunked ||
+                        (pendingsc->mChunked && mScChunkedStatus == ScChunkedStatus::NotStarted && *jsonsc.pos == '{'))
+                    {
+                        jsonsc.enterobject();
+                    }
+
                     app->notify_network_activity(NetworkActivityChannel::SC,
                                                  NetworkActivityType::REQUEST_RECEIVED,
                                                  API_OK);
@@ -3196,6 +3251,38 @@ void MegaClient::exec()
                 break;
 
             case REQ_INFLIGHT:
+                // Handle real-time chunked data processing for server-client requests
+                if (pendingsc->contentlength > 0 && pendingsc->bufpos > pendingsc->notifiedbufpos)
+                {
+                    if (pendingsc->mChunked)
+                    {
+                        size_t availableBytes = pendingsc->bufpos - pendingsc->notifiedbufpos;
+                        LOG_info << "Processing SC chunk: contentlength=" << pendingsc->contentlength
+                                << ", bufpos=" << pendingsc->bufpos
+                                << ", notifiedbufpos=" << pendingsc->notifiedbufpos
+                                << ", availableBytes=" << availableBytes;
+                        // Process incoming chunks of actionpackets in real-time
+                        if (availableBytes > 0)
+                        {
+                            LOG_warn << "Started real-time SC chunk processing";
+                            int bytes = procscchunk();
+                            if (bytes > 0)
+                            {
+                                mScChunkedProcessBytes += bytes;
+                                pendingsc->purge(bytes);
+                            }
+
+                            pendingsc->notifiedbufpos = pendingsc->bufpos;
+                        }
+                    }
+                    else
+                    {
+                        // For non-chunked requests, just update progress notification
+                        pendingsc->notifiedbufpos = pendingsc->bufpos;
+                    }
+                }
+                
+                // Check for timeout
                 if (!pendingscTimedOut && Waiter::ds >= (pendingsc->lastdata + HttpIO::SCREQUESTTIMEOUT))
                 {
                     LOG_debug << clientname << "sc timeout expired at ds: " << Waiter::ds << " and lastdata ds: " << pendingsc->lastdata;
@@ -3217,8 +3304,14 @@ void MegaClient::exec()
             {
                 // completed - initiate next SC request
                 jsonsc.pos = nullptr;
-                pendingsc.reset();
-                btsc.reset();
+                
+                // For chunked mode, we may have been processing data incrementally
+                // Reset the request when all processing is complete
+                if (pendingsc && (pendingsc->status == REQ_SUCCESS || !pendingsc->mChunked))
+                {
+                    pendingsc.reset();
+                    btsc.reset();
+                }
             }
         }
 
@@ -3276,6 +3369,12 @@ void MegaClient::exec()
                 }
 
                 pendingsc->type = REQ_JSON;
+
+                // Enable chunked processing for real-time actionpackets handling
+                // This allows processing actionpackets as they arrive, improving responsiveness
+                // However VPN client shouldn't need it, because it'll receive a minimal response
+                pendingsc->mChunked = !isClientType(ClientType::VPN);
+
                 pendingsc->post(this);
                 app->notify_network_activity(NetworkActivityChannel::SC,
                                              NetworkActivityType::REQUEST_SENT,
@@ -5213,6 +5312,267 @@ void MegaClient::httprequest(const char *url, int method, bool binary, const cha
     }
 }
 
+// process the non-insca part of action packet
+bool MegaClient::processNonInSCAPacket(JSON* json, std::unique_lock<recursive_mutex>* nodeTreeIsChanging, bool originalAC, bool &shouldreturn)
+{
+    shouldreturn = false;
+    if (insca)
+        return true;
+
+    switch (json->getnameid())
+    {
+        case makeNameid("w"):
+            json->storeobject(&scnotifyurl);
+            break;
+
+        case makeNameid("ir"):
+            // when spoonfeeding is in action, there may still be more actionpackets to be delivered.
+            insca_notlast = json->getint() == 1;
+            break;
+
+        case makeNameid("sn"):
+            // the sn element is guaranteed to be the last in sequence (except for notification requests (c=50))
+            scsn.setScsn(json);
+            // At this point no CurrentSeqtag should be seen. mCurrentSeqtagSeen is set true
+            // when action package is processed and the seq tag matches with mCurrentSeqtag
+            assert(!mCurrentSeqtagSeen);
+            notifypurge();
+            if (sctable)
+            {
+                if (!pendingcs && !csretrying && !reqs.readyToSend())
+                {
+                    LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
+                    sctable->commit();
+                    sctable->begin();
+                    app->notify_dbcommit();
+                    pendingsccommit = false;
+                }
+                else
+                {
+                    LOG_debug << "Postponing DB commit until cs requests finish";
+                    pendingsccommit = true;
+                }
+            }
+            break;
+
+        case EOO:
+            if (!useralerts.isDeletedSharedNodesStashEmpty())
+            {
+                useralerts.purgeNodeVersionsFromStash();
+                useralerts.convertStashedDeletedSharedNodes();
+            }
+
+            LOG_debug << "Processing of action packets for " << string(sessionid, sizeof(sessionid)) << " finished.  More to follow: " << insca_notlast;
+            mergenewshares(1);
+            applykeys();
+            mNewKeyRepository.clear();
+
+            if (!statecurrent && !insca_notlast)   // with actionpacket spoonfeeding, just finishing a batch does not mean we are up to date yet - keep going while "ir":1
+            {
+                if (fetchingnodes)
+                {
+                    notifypurge();
+                    if (sctable)
+                    {
+                        LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
+                        sctable->commit();
+                        sctable->begin();
+                        pendingsccommit = false;
+                    }
+
+                    WAIT_CLASS::bumpds();
+                    fnstats.timeToResult = Waiter::ds - fnstats.startTime;
+                    fnstats.timeToCurrent = fnstats.timeToResult;
+
+                    fetchingnodes = false;
+                    restag = fetchnodestag;
+                    fetchnodestag = 0;
+
+                    if (!mBlockedSet && mCachedStatus.lookup(CacheableStatus::STATUS_BLOCKED, 0)) //block state not received in this execution, and cached says we were blocked last time
+                    {
+                        LOG_debug << "cached blocked states reports blocked, and no block state has been received before, issuing whyamiblocked";
+                        whyamiblocked();// lets query again, to trigger transition and restoreSyncs
+                    }
+
+                    enabletransferresumption();
+                    app->fetchnodes_result(API_OK);
+                    app->notify_dbcommit();
+                    fetchnodesAlreadyCompletedThisSession = true;
+
+                    WAIT_CLASS::bumpds();
+                    fnstats.timeToSyncsResumed = Waiter::ds - fnstats.startTime;
+
+                    if (!loggedIntoFolder())
+                    {
+                        // historic user alerts are not supported for public folders
+                        // now that we have fetched everything and caught up actionpackets since that state,
+                        // our next sc request can be for useralerts
+                        useralerts.begincatchup = true;
+                    }
+                }
+                else
+                {
+                    WAIT_CLASS::bumpds();
+                    fnstats.timeToCurrent = Waiter::ds - fnstats.startTime;
+                }
+                uint64_t numNodes = mNodeManager.getNodeCount();
+                fnstats.nodesCurrent = static_cast<long long>(numNodes);
+
+                if (mKeyManager.generation())
+                {
+                    // Clear in-use bit if needed for the shared nodes in ^!keys.
+                    mKeyManager.syncSharekeyInUseBit();
+                }
+
+                statecurrent = true;
+                app->nodes_current();
+                mFuseService.current();
+                LOG_debug << "Cloud node tree up to date";
+
+#ifdef ENABLE_SYNC
+                // Don't start sync activity until `statecurrent` as it could take actions based on old state
+                // The reworked sync code can figure out what to do once fully up to date.
+                if (nodeTreeIsChanging)
+                {
+                    nodeTreeIsChanging->unlock();
+                }
+                if (!syncsAlreadyLoadedOnStatecurrent)
+                {
+                    syncs.resumeSyncsOnStateCurrent();
+                    syncsAlreadyLoadedOnStatecurrent = true;
+                }
+#endif
+                if (tctable && cachedfiles.size())
+                {
+                    TransferDbCommitter committer(tctable);
+                    for (unsigned int i = 0; i < cachedfiles.size(); i++)
+                    {
+                        direction_t type = NONE;
+                        File* file = app->file_resume(&cachedfiles.at(i),
+                                                        &type,
+                                                        cachedfilesdbids.at(i));
+                        if (!file || (type != GET && type != PUT))
+                        {
+                            tctable->del(cachedfilesdbids.at(i));
+                            continue;
+                        }
+                        if (!startxfer(type, file, committer, false, false, false, UseLocalVersioningFlag, nullptr, nextreqtag()))  // TODO: should we have serialized these flags and restored them?
+                        {
+                            tctable->del(cachedfilesdbids.at(i));
+                            continue;
+                        }
+                    }
+                    cachedfiles.clear();
+                    cachedfilesdbids.clear();
+                }
+
+                WAIT_CLASS::bumpds();
+                fnstats.timeToTransfersResumed = Waiter::ds - fnstats.startTime;
+
+                string report;
+                fnstats.toJsonArray(&report);
+
+                sendevent(99426, report.c_str(), 0);    // Treeproc performance log
+
+                // NULL vector: "notify all elements"
+                app->nodes_updated(NULL, int(numNodes));
+                app->users_updated(NULL, int(users.size()));
+                app->pcrs_updated(NULL, int(pcrindex.size()));
+                app->sets_updated(nullptr, int(mSets.size()));
+                app->setelements_updated(nullptr, int(mSetElements.size()));
+#ifdef ENABLE_CHAT
+                app->chats_updated(NULL, int(chats.size()));
+#endif
+                app->useralerts_updated(nullptr, int(useralerts.alerts.size()));
+                mNodeManager.removeChanges();
+
+                // if ^!keys doesn't exist yet -> migrate the private keys from legacy attrs to ^!keys
+                if (loggedin() == FULLACCOUNT)
+                {
+                    if (!mKeyManager.generation())
+                    {
+                        assert(!mKeyManager.getPostRegistration());
+                        app->upgrading_security();
+                    }
+                    else
+                    {
+                        fetchContactsKeys();
+                        sc_pk();
+                    }
+                }
+            }
+
+            {
+                // In case a fetchnodes() occurs mid-session.  We should not allow
+                // the syncs to see the new tree unless we've caught up to at least
+                // the same scsn/seqTag as we were at before.  ir:1 is not always reliable
+                bool scTagNotCaughtUp =  !mScDbStateRecord.seqTag.empty() &&
+                                            !mLargestEverSeenScSeqTag.empty() &&
+                                            (mScDbStateRecord.seqTag.size() < mLargestEverSeenScSeqTag.size() ||
+                                            (mScDbStateRecord.seqTag.size() == mLargestEverSeenScSeqTag.size() &&
+                                            mScDbStateRecord.seqTag < mLargestEverSeenScSeqTag));
+
+                bool ac = statecurrent && !insca_notlast && !scTagNotCaughtUp;
+
+                if (!originalAC && ac)
+                {
+                    LOG_debug << clientname << "actionpacketsCurrent is true again";
+
+                }
+                actionpacketsCurrent = ac;
+            }
+
+            if (!insca_notlast)
+            {
+                if (mReceivingCatchUp)
+                {
+                    mReceivingCatchUp = false;
+                    mPendingCatchUps--;
+                    LOG_debug << "catchup complete. Still pending: " << mPendingCatchUps;
+                    app->catchup_result();
+                }
+            }
+
+            if (pendingsccommit && sctable && !reqs.cmdsInflight() && scsn.ready())
+            {
+                LOG_debug << "Executing postponed DB commit 1";
+                sctable->commit();
+                sctable->begin();
+                app->notify_dbcommit();
+                pendingsccommit = false;
+            }
+
+            if (pendingsccommit)
+            {
+                LOG_debug << "Postponing DB commit until cs requests finish (spoonfeeding)";
+            }
+
+#ifdef ENABLE_SYNC
+            syncs.waiter->notify();
+#endif
+
+            shouldreturn = true;
+            return true;
+
+        case makeNameid("a"):
+            if (json->enterarray())
+            {
+                LOG_debug << "Processing action packets for " << string(sessionid, sizeof(sessionid));
+                insca = true;
+                break;
+            }
+            // fall through
+        default:
+            if (!json->storeobject())
+            {
+                LOG_err << "Error parsing sc request";
+                shouldreturn = true;
+                return true;
+            }
+    }
+    return true;
+}
+
 // process server-client request
 bool MegaClient::procsc()
 {
@@ -5223,500 +5583,869 @@ bool MegaClient::procsc()
     actionpacketsCurrent = false;
 
     CodeCounter::ScopeTimer ccst(performanceStats.scProcessingTime);
-    nameid name;
 
-    std::shared_ptr<Node> lastAPDeletedNode;
+    mScChunkedLastAPDeletedNode.reset();
 
     for (;;)
     {
         if (!insca)
         {
-            switch (jsonsc.getnameid())
+            bool shouldreturn = false;
+            auto result = processNonInSCAPacket(&jsonsc,
+                    &nodeTreeIsChanging, originalAC, shouldreturn);
+            if (shouldreturn)
             {
-                case makeNameid("w"):
-                    jsonsc.storeobject(&scnotifyurl);
-                    break;
-
-                case makeNameid("ir"):
-                    // when spoonfeeding is in action, there may still be more actionpackets to be delivered.
-                    insca_notlast = jsonsc.getint() == 1;
-                    break;
-
-                case makeNameid("sn"):
-                    // the sn element is guaranteed to be the last in sequence (except for notification requests (c=50))
-                    scsn.setScsn(&jsonsc);
-                    // At this point no CurrentSeqtag should be seen. mCurrentSeqtagSeen is set true
-                    // when action package is processed and the seq tag matches with mCurrentSeqtag
-                    assert(!mCurrentSeqtagSeen);
-                    notifypurge();
-                    if (sctable)
-                    {
-                        if (!pendingcs && !csretrying && !reqs.readyToSend())
-                        {
-                            LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
-                            sctable->commit();
-                            sctable->begin();
-                            app->notify_dbcommit();
-                            pendingsccommit = false;
-                        }
-                        else
-                        {
-                            LOG_debug << "Postponing DB commit until cs requests finish";
-                            pendingsccommit = true;
-                        }
-                    }
-                    break;
-
-                case EOO:
-                    if (!useralerts.isDeletedSharedNodesStashEmpty())
-                    {
-			useralerts.purgeNodeVersionsFromStash();
-                        useralerts.convertStashedDeletedSharedNodes();
-                    }
-
-
-                    LOG_debug << "Processing of action packets for " << string(sessionid, sizeof(sessionid)) << " finished.  More to follow: " << insca_notlast;
-                    mergenewshares(1);
-                    applykeys();
-                    mNewKeyRepository.clear();
-
-                    if (!statecurrent && !insca_notlast)   // with actionpacket spoonfeeding, just finishing a batch does not mean we are up to date yet - keep going while "ir":1
-                    {
-                        if (fetchingnodes)
-                        {
-                            notifypurge();
-                            if (sctable)
-                            {
-                                LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
-                                sctable->commit();
-                                sctable->begin();
-                                pendingsccommit = false;
-                            }
-
-                            WAIT_CLASS::bumpds();
-                            fnstats.timeToResult = Waiter::ds - fnstats.startTime;
-                            fnstats.timeToCurrent = fnstats.timeToResult;
-
-                            fetchingnodes = false;
-                            restag = fetchnodestag;
-                            fetchnodestag = 0;
-
-                            if (!mBlockedSet && mCachedStatus.lookup(CacheableStatus::STATUS_BLOCKED, 0)) //block state not received in this execution, and cached says we were blocked last time
-                            {
-                                LOG_debug << "cached blocked states reports blocked, and no block state has been received before, issuing whyamiblocked";
-                                whyamiblocked();// lets query again, to trigger transition and restoreSyncs
-                            }
-
-                            enabletransferresumption();
-                            app->fetchnodes_result(API_OK);
-                            app->notify_dbcommit();
-                            fetchnodesAlreadyCompletedThisSession = true;
-
-                            WAIT_CLASS::bumpds();
-                            fnstats.timeToSyncsResumed = Waiter::ds - fnstats.startTime;
-
-                            if (!loggedIntoFolder())
-                            {
-                                // historic user alerts are not supported for public folders
-                                // now that we have fetched everything and caught up actionpackets since that state,
-                                // our next sc request can be for useralerts
-                                useralerts.begincatchup = true;
-                            }
-                        }
-                        else
-                        {
-                            WAIT_CLASS::bumpds();
-                            fnstats.timeToCurrent = Waiter::ds - fnstats.startTime;
-                        }
-                        uint64_t numNodes = mNodeManager.getNodeCount();
-                        fnstats.nodesCurrent = static_cast<long long>(numNodes);
-
-                        if (mKeyManager.generation())
-                        {
-                            // Clear in-use bit if needed for the shared nodes in ^!keys.
-                            mKeyManager.syncSharekeyInUseBit();
-                        }
-
-                        statecurrent = true;
-                        app->nodes_current();
-                        mFuseService.current();
-                        LOG_debug << "Cloud node tree up to date";
-
-#ifdef ENABLE_SYNC
-                        // Don't start sync activity until `statecurrent` as it could take actions based on old state
-                        // The reworked sync code can figure out what to do once fully up to date.
-                        nodeTreeIsChanging.unlock();
-                        if (!syncsAlreadyLoadedOnStatecurrent)
-                        {
-                            syncs.resumeSyncsOnStateCurrent();
-                            syncsAlreadyLoadedOnStatecurrent = true;
-                        }
-#endif
-                        if (tctable && cachedfiles.size())
-                        {
-                            TransferDbCommitter committer(tctable);
-                            for (unsigned int i = 0; i < cachedfiles.size(); i++)
-                            {
-                                direction_t type = NONE;
-                                File* file = app->file_resume(&cachedfiles.at(i),
-                                                              &type,
-                                                              cachedfilesdbids.at(i));
-                                if (!file || (type != GET && type != PUT))
-                                {
-                                    tctable->del(cachedfilesdbids.at(i));
-                                    continue;
-                                }
-                                if (!startxfer(type, file, committer, false, false, false, UseLocalVersioningFlag, nullptr, nextreqtag()))  // TODO: should we have serialized these flags and restored them?
-                                {
-                                    tctable->del(cachedfilesdbids.at(i));
-                                    continue;
-                                }
-                            }
-                            cachedfiles.clear();
-                            cachedfilesdbids.clear();
-                        }
-
-                        WAIT_CLASS::bumpds();
-                        fnstats.timeToTransfersResumed = Waiter::ds - fnstats.startTime;
-
-                        string report;
-                        fnstats.toJsonArray(&report);
-
-                        sendevent(99426, report.c_str(), 0);    // Treeproc performance log
-
-                        // NULL vector: "notify all elements"
-                        app->nodes_updated(NULL, int(numNodes));
-                        app->users_updated(NULL, int(users.size()));
-                        app->pcrs_updated(NULL, int(pcrindex.size()));
-                        app->sets_updated(nullptr, int(mSets.size()));
-                        app->setelements_updated(nullptr, int(mSetElements.size()));
-#ifdef ENABLE_CHAT
-                        app->chats_updated(NULL, int(chats.size()));
-#endif
-                        app->useralerts_updated(nullptr, int(useralerts.alerts.size()));
-                        mNodeManager.removeChanges();
-
-                        // if ^!keys doesn't exist yet -> migrate the private keys from legacy attrs to ^!keys
-                        if (loggedin() == FULLACCOUNT)
-                        {
-                            if (!mKeyManager.generation())
-                            {
-                                assert(!mKeyManager.getPostRegistration());
-                                app->upgrading_security();
-                            }
-                            else
-                            {
-                                fetchContactsKeys();
-                                sc_pk();
-                            }
-                        }
-                    }
-
-                    {
-                        // In case a fetchnodes() occurs mid-session.  We should not allow
-                        // the syncs to see the new tree unless we've caught up to at least
-                        // the same scsn/seqTag as we were at before.  ir:1 is not always reliable
-                        bool scTagNotCaughtUp =  !mScDbStateRecord.seqTag.empty() &&
-                                                 !mLargestEverSeenScSeqTag.empty() &&
-                                                 (mScDbStateRecord.seqTag.size() < mLargestEverSeenScSeqTag.size() ||
-                                                  (mScDbStateRecord.seqTag.size() == mLargestEverSeenScSeqTag.size() &&
-                                                  mScDbStateRecord.seqTag < mLargestEverSeenScSeqTag));
-
-                        bool ac = statecurrent && !insca_notlast && !scTagNotCaughtUp;
-
-                        if (!originalAC && ac)
-                        {
-                            LOG_debug << clientname << "actionpacketsCurrent is true again";
-
-                        }
-                        actionpacketsCurrent = ac;
-                    }
-
-                    if (!insca_notlast)
-                    {
-                        if (mReceivingCatchUp)
-                        {
-                            mReceivingCatchUp = false;
-                            mPendingCatchUps--;
-                            LOG_debug << "catchup complete. Still pending: " << mPendingCatchUps;
-                            app->catchup_result();
-                        }
-                    }
-
-                    if (pendingsccommit && sctable && !reqs.cmdsInflight() && scsn.ready())
-                    {
-                        LOG_debug << "Executing postponed DB commit 1";
-                        sctable->commit();
-                        sctable->begin();
-                        app->notify_dbcommit();
-                        pendingsccommit = false;
-                    }
-
-                    if (pendingsccommit)
-                    {
-                        LOG_debug << "Postponing DB commit until cs requests finish (spoonfeeding)";
-                    }
-
-#ifdef ENABLE_SYNC
-                    syncs.waiter->notify();
-#endif
-
-                    return true;
-
-                case makeNameid("a"):
-                    if (jsonsc.enterarray())
-                    {
-                        LOG_debug << "Processing action packets for " << string(sessionid, sizeof(sessionid));
-                        insca = true;
-                        break;
-                    }
-                    // fall through
-                default:
-                    if (!jsonsc.storeobject())
-                    {
-                        LOG_err << "Error parsing sc request";
-                        return true;
-                    }
+                return result;
             }
         }
 
         if (insca)
         {
-            auto actionpacketStart = jsonsc.pos;
-            if (jsonsc.enterobject())
+            // set nullptr to use jsonsc.pos
+            if (!processActionPacket(nullptr))
             {
-                // Check if it is ok to process the current action packet.
-                if (!sc_checkActionPacket(lastAPDeletedNode.get()))
+                return false;
+            }
+        }
+    }
+}
+
+static void breakme(const char *action, const char *chunk)
+{
+    std::cout << "Breaking at <" << action << ">: " << string(chunk).substr(0, 20) << std::endl;
+    // This function is a placeholder for breaking in gdb
+}
+
+// process server-client request in chunked mode
+// return the number of bytes processed
+int MegaClient::procscchunk()
+{
+    // non-chunked mode, do nothing
+    if (!pendingsc->mChunked)
+    {
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
+        return 0;
+    }
+
+    m_off_t processed = 0;
+    bool start = !jsonsc.pos;
+    auto chunk = pendingsc->data();
+    jsonsc.begin(chunk);
+
+    if (start)
+    {
+        // Initialize action packet filters on first call (pattern matching approach)
+        if (mActionPacketFilters.empty())
+        {
+            initializeActionPacketFilters();
+        }
+        assert(mActionPacketSplitter.isStarting());
+    }
+    else
+    {
+        if (mActionPacketFilters.empty())
+        {
+            LOG_err << "ActionPacket filters not initialized, probably failed from previous chunk, please check logs.";
+            mActionPacketSplitter.clear();
+            mActionPacketFilters.clear();
+            return 0;
+        }
+    }
+
+    // Process the chunk using streaming JSON splitter with filters
+    processed += mActionPacketSplitter.processChunk(&mActionPacketFilters, chunk);
+
+    // Check for processing completion or errors
+    if (mActionPacketSplitter.hasFailed())
+    {
+        breakme("F", chunk);
+        LOG_err << "ActionPacket JSON processing failed";
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
+        return 0;
+    }
+
+    if (mActionPacketSplitter.hasFinished())
+    {
+        LOG_debug << "ActionPacket JSON processing completed";
+        if (!jsonsc.leavearray())
+        {
+            LOG_err << "Unexpected end of JSON stream: " << jsonsc.pos;
+            mActionPacketSplitter.clear();
+            mActionPacketFilters.clear();
+            assert(false);
+            return 0;
+        }
+        else
+        {
+            processed++;
+        }
+        assert(!chunk[processed]);
+        // Reset for next round
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
+        insca = false;
+    }
+
+    return static_cast<int>(processed);
+}
+
+void MegaClient::initializeActionPacketFilters()
+{
+    LOG_debug << "Initializing ActionPacket filters for pattern matching";
+
+    // Clear any existing filters
+    mActionPacketFilters.clear();
+
+    // Filter for chunk processing start
+    mActionPacketFilters.emplace("<", [this](JSON *json)
+    {
+        breakme("<", json->pos);
+        LOG_debug << "ActionPacket chunk processing started";
+        if (mScNodeTreeIsChanging)
+        {
+            delete mScNodeTreeIsChanging;
+        }
+        mScNodeTreeIsChanging = new std::unique_lock<recursive_mutex>(nodeTreeMutex);
+        mScOriginalAC = actionpacketsCurrent;
+        actionpacketsCurrent = false;
+        mScChunkedStatus = ScChunkedStatus::NotStarted;
+        return true;
+    });
+
+    // Filter for chunk processing completion
+    mActionPacketFilters.emplace(">", [this](JSON *json)
+    {
+        breakme(">", json->pos);
+        LOG_debug << "ActionPacket chunk processing completed";
+        mScChunkedStatus = ScChunkedStatus::NotStarted;
+        mActionPacketSplitter.clear();
+        mActionPacketFilters.clear();
+        return true;
+    });
+
+    // Filter for actionpacket array start
+    mActionPacketFilters.emplace("{a[", [this](JSON *json)
+    {
+        breakme("{a[", json->pos);
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+        {
+            if (strncmp(json->pos, "{\"a\":[", 6) == 0)
+            {
+                json->pos += 6; // go to start of A array element
+            }
+        }
+        LOG_debug << "ActionPacket array processing started";
+        return true;
+    });
+
+    // Filter for individual actionpackets within array
+    mActionPacketFilters.emplace("{[a{", [this](JSON *json) // c
+    {
+        breakme("{[a{", json->pos);
+        LOG_debug << "Processing individual actionpacket";
+        return processActionPacketFromFilter(json);
+    });
+
+    // Filter for "f" array elements within "t" action
+    mActionPacketFilters.emplace("{[a{{t[f{", [this](JSON *json) // c
+    {
+        breakme("{[a{{t[f{", json->pos);
+        LOG_debug << "Processing node from 'f' array";
+        mScChunkedFIsV2 = false;
+        return processNodeFromFArrayFilter(json);
+    });
+
+    // Filter for "f2" array elements within "t" action (versioned nodes)
+    mActionPacketFilters.emplace("{[a{{t[f2{", [this](JSON *json) // c
+    {
+        breakme("{[a{{t[f2{", json->pos);
+        LOG_debug << "Processing versioned node from 'f2' array";
+        mScChunkedFIsV2 = true;
+        return processNodeFromFArrayFilter(json);
+    });
+
+    mActionPacketFilters.emplace("{", [this](JSON *json)
+    {
+        breakme("{", json->pos);
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+        {
+        }
+        if (mScChunkedStatus == ScChunkedStatus::ProcessingAction)
+        {
+            for(;!insca;)
+            {
+                bool shouldreturn = false;
+                processNonInSCAPacket(json,
+                        mScNodeTreeIsChanging, mScOriginalAC, shouldreturn);
+                if (shouldreturn)
                 {
-                    // We can't continue actionpackets until we know the next mCurrentSeqtag to match against, wait for the CS request to deliver it.
-                    assert(reqs.cmdsInflight());
-                    jsonsc.pos = actionpacketStart;
+                    break;
+                }
+            }
+            mScChunkedStatus = ScChunkedStatus::NotStarted;
+            if (mScNodeTreeIsChanging)
+            {
+                delete mScNodeTreeIsChanging;
+                mScNodeTreeIsChanging = nullptr;
+            }
+            app->notify_network_activity(NetworkActivityChannel::SC,
+                                         NetworkActivityType::REQUEST_RECEIVED,
+                                         API_OK);
+        }
+        return true;
+    });
+
+    // Filter for error handling
+    mActionPacketFilters.emplace("E", [this](JSON *json)
+    {
+        breakme("E", json->pos);
+        LOG_err << "Error processing actionpacket chunk: " << json->pos;
+        return false;
+    });
+
+    LOG_debug << "ActionPacket filters initialized: " << mActionPacketFilters.size() << " filters";
+}
+
+// Helper functions for pattern-based filter processing
+// callback for "{[a{"
+bool MegaClient::processActionPacketFromFilter(JSON* json)
+{
+    try
+    {
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+        {
+            LOG_debug << "ActionPacket individual processing started";
+            // Initialize JSON processing for chunked server-client data
+            insca = false;
+            insca_notlast = false;
+            mScChunkedLastAPDeletedNode.reset();
+            mScChunkedStatus = ScChunkedStatus::ProcessingAction;
+        }
+        if (mScChunkedStatus == ScChunkedStatus::ProcessingTElement)
+        {
+            LOG_debug << "Finishing 't' element processing, pos: " << std::string(json->pos).substr(0, 20);
+            if (strncmp(json->pos, "]}", 2) == 0)
+            {
+                json->pos += 2; // Move past "]}"
+                LOG_debug << "Finishing 'f' array processing";
+                if (postprocessFArrayElement(json))
+                {
+                    mScChunkedStatus = ScChunkedStatus::ProcessingAction;
+                    return true;
+                }
+                LOG_err << "Error postprocessing 'f' array: " << json->pos;
+                return false;
+            }
+        }
+        if (mScChunkedStatus != ScChunkedStatus::ProcessingAction)
+        {
+            LOG_err << "Unexpected state for processing individual actionpacket: " << static_cast<int>(mScChunkedStatus);
+            return false;
+        }
+        // Process complete actionpacket using existing logic
+        bool result = processActionPacket(json->pos);
+        if (result)
+        {
+            json->storeobject();
+            return true;
+        }
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing actionpacket: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processTActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Enter the "t" action object
+        if (!json->enterobject())
+        {
+            return false;
+        }
+
+        bool foundF = false;
+        mScChunkedFIsV2 = false;
+
+        for (;;)
+        {
+            auto name = json->getnameid();
+            auto objectpos = json->pos;
+
+            switch (name)
+            {
+            case makeNameid("t"):
+                if (json->enterobject())
+                {
+                    for (;;)
+                    {
+                        switch (json->getnameid())
+                        {
+                        case makeNameid("f2"):
+                            mScChunkedFIsV2 = true;
+                            // fall through
+                        case makeNameid("f"):
+                            if (json->enterarray())
+                            {
+                                mScChunkedStatus = ScChunkedStatus::ProcessingTElement;
+                                foundF = true;
+                                // The JSONSplitter will handle processing individual elements
+                                return true;
+                            }
+                            break;
+                        case EOO:
+                            json->leaveobject();
+                            goto exit_t_loop;
+                        default:
+                            if (!json->storeobject())
+                            {
+                                return false;
+                            }
+                            break;
+                        }
+                    }
+                }
+                break;
+
+            case name_id::u:
+                json->pos = objectpos;
+                readusers(json, true);
+                break;
+
+            case makeNameid("ou"):
+                json->pos = objectpos;
+                mScChunkedOriginatingUserHandle = json->gethandle(USERHANDLE);
+                break;
+
+            case EOO:
+                json->leaveobject();
+                return true;
+
+            default:
+                if (!json->storeobject())
+                {
+                    return false;
+                }
+                break;
+            }
+        }
+        exit_t_loop:
+
+        return foundF;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing 't' action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::preprocessFArrayElement(JSON* json)
+{
+    auto startpos = json->pos;
+    try
+    {
+        if (strncmp(json->pos, "{\"a\":\"t\"", 8))
+        {
+            // Not a 't' action, skip preprocessing
+            return false;
+        }
+
+        json->pos += 8; // Move past {"a":"t"
+
+        // Process each element in the 'a' array
+        for (;;)
+        {
+            auto name = json->getnameid();
+            auto objectpos = json->pos;
+            switch (name)
+            {
+            case makeNameid("t"):
+                json->enterobject();
+                if (strncmp(json->pos, "\"f\":[", 5) == 0)
+                {
+                    json->pos += 5; // Move past "f":[
+                    return true;
+                }
+                if (strncmp(json->pos, "\"f2\":[", 6) == 0)
+                {
+                    json->pos += 6; // Move past "f2":[
+                    return true;
+                }
+                LOG_err << "Unexpected 't' object structure";
+                goto exit_main_loop;
+            case name_id::u:
+                json->pos = objectpos;
+                readusers(json, true);
+                break;
+            case makeNameid("ou"):
+                json->pos = objectpos;
+                mScChunkedOriginatingUserHandle = json->gethandle(USERHANDLE);
+                break;
+            case EOO:
+                goto exit_main_loop;
+            default:
+                if(!json->storeobject())
+                {
+                    goto exit_main_loop; // Incomplete, wait for more data
+                }
+                break;
+            }
+        }
+        exit_main_loop:
+        LOG_err << "Incomplete packet detected, should not happen!";
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error preprocessing 'f' array element: " << e.what();
+    }
+    json->pos = startpos;
+    return false;
+}
+
+bool MegaClient::postprocessFArrayElement(JSON* json)
+{
+    auto startpos = json->pos;
+    try
+    {
+        // Process each element in the 'a' array
+        for (;;)
+        {
+            auto name = json->getnameid();
+            auto objectpos = json->pos;
+            switch (name)
+            {
+            case makeNameid("t"):
+                LOG_err << "Unexpected 't' object in post stage!";
+                goto exit_main_loop;
+            case name_id::u:
+                json->pos = objectpos;
+                readusers(json, true);
+                break;
+            case makeNameid("ou"):
+                json->pos = objectpos;
+                mScChunkedOriginatingUserHandle = json->gethandle(USERHANDLE);
+                break;
+            case EOO:
+                if (json->leaveobject())
+                {
+                    return true;
+                }
+                goto exit_main_loop;
+            default:
+                if(!json->storeobject())
+                {
+                    goto exit_main_loop; // Incomplete, wait for more data
+                }
+                break;
+            }
+        }
+        exit_main_loop:
+        LOG_err << "Incomplete packet detected, should not happen!";
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error finishing 'f' array: " << e.what();
+    }
+    json->pos = startpos;
+    return false;
+}
+
+
+bool MegaClient::processNodeFromFArrayFilter(JSON* json)
+{
+    try
+    {
+        // Save current position
+        const char* nodeStart = json->pos;
+        LOG_debug << "NodeFromFArray JSON starts at: " << nodeStart;
+
+        if (mScChunkedStatus == ScChunkedStatus::NotStarted ||
+            mScChunkedStatus == ScChunkedStatus::ProcessingAction)
+        {
+            LOG_debug << "ActionPacket 'f' element processing started";
+            if (mScChunkedStatus == ScChunkedStatus::NotStarted)
+            {
+                // Initialize JSON processing for chunked server-client data
+                insca = false;
+                insca_notlast = false;
+                mScChunkedLastAPDeletedNode.reset();
+                mScChunkedStatus = ScChunkedStatus::ProcessingAction;
+            }
+            if (strncmp(json->pos, "{\"a\":[", 6) == 0)
+            {
+                json->pos += 6; // go to start of {"a":[
+            }
+            if (strncmp(json->pos, "{\"a\":\"t\"", 8) == 0)
+            {
+                auto result = preprocessFArrayElement(json);
+                if (!result)
+                {
                     return false;
                 }
             }
-            jsonsc.pos = actionpacketStart;
+            mScChunkedStatus = ScChunkedStatus::ProcessingTElement;
+        }
+        assert(mScChunkedStatus == ScChunkedStatus::ProcessingTElement);
 
-            if (jsonsc.enterobject())
+        assert(json->enterobject());
+
+        // Store the complete node object
+        std::string nodeJson;
+        --json->pos; // back to {
+        assert(json->storeobject(&nodeJson));
+
+        // Reconstruct the full t element for processing
+        string f = mScChunkedFIsV2 ? "f2" : "f";
+        string fullElement = "{\"" + f + "\":[" + nodeJson + "]}";
+
+        // Process this complete t element using existing logic
+        processTElement(fullElement.c_str());
+
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing node from f array: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processUserUpdateFromFilter(JSON* json)
+{
+    try
+    {
+        return readusers(json, true) == 1;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing user update: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processDeletionActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process deletion action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing deletion action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processUpdateActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process update/move action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing update action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processNewNodeActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process new node action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing new node action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::processShareActionFromFilter(JSON* json)
+{
+    try
+    {
+        // Process share action using existing logic
+        return processActionPacket(json->pos);
+    }
+    catch (const std::exception& e)
+    {
+        LOG_err << "Error processing share action: " << e.what();
+        return false;
+    }
+}
+
+bool MegaClient::isSelfOriginatingAction(const char *json, nameid name)
+{
+    // "i" marker element guaranteed to be following
+    // "a" element if present
+    if (fetchingnodes || !Utils::startswith(json, "\"i\":\"") ||
+        memcmp(json + 5, sessionid, sizeof sessionid) ||
+        json[5 + sizeof sessionid] != '"' || name == name_id::d ||
+        name == 't') // we still set 'i' on move commands to produce backward
+                        // compatible actionpackets, so don't skip those here
+                    return false;
+    return true;
+}
+
+// Process individual action packet from chunked server-client request
+bool MegaClient::processActionPacket(const char* startpos)
+{
+    // Save current jsonsc position to restore if needed
+    auto actionStart = jsonsc.pos;
+
+    try
+    {
+        // Process on another pos
+        if (startpos)
+        {
+            jsonsc.pos = startpos;
+        }
+
+        // Enter the action packet object
+        if (!jsonsc.enterobject())
+        {
+            LOG_warn << "Failed to enter action packet object in chunked processing, trailing json: " << jsonsc.pos;
+            jsonsc.pos = actionStart;
+            return false;
+        }
+
+        // Check if it is ok to process the current action packet.
+        auto pos = jsonsc.pos;
+        auto checkresult = sc_checkActionPacket(mScChunkedLastAPDeletedNode.get());
+        jsonsc.pos = pos;
+        if (!checkresult)
+        {
+            // We can't continue actionpackets until we know the next mCurrentSeqtag to match against, wait for the CS request to deliver it.
+            assert(reqs.cmdsInflight());
+            jsonsc.pos = actionStart;
+            return false;
+        }
+
+        if (jsonsc.getnameid() != makeNameid("a"))
+        {
+            LOG_warn << "Not an action packet in chunked processing";
+            jsonsc.pos = actionStart;
+            return false;
+        }
+
+        if (!statecurrent)
+        {
+            fnstats.actionPackets++;
+        }
+
+        // Process the action packet
+        nameid name = jsonsc.getnameidvalue();
+
+        // only process server-client request if not marked as self-originating
+        if (!isSelfOriginatingAction(jsonsc.pos, name))
+        {
+#ifdef ENABLE_CHAT
+            bool readingPublicChat = false;
+#endif
+            switch (name)
             {
-                // the "a" attribute is guaranteed to be the first in the object
-                if (jsonsc.getnameid() == makeNameid("a"))
+                case name_id::u:
+                    // node update
+                    sc_updatenode();
+                    break;
+
+                case makeNameid("t"):
                 {
-                    if (!statecurrent)
+                    bool isMoveOperation = false;
+                    // node addition
                     {
-                        fnstats.actionPackets++;
+                        if (!loggedIntoFolder())
+                            useralerts.beginNotingSharedNodes();
+                        handle originatingUser = sc_newnodes(fetchingnodes ? nullptr : mScChunkedLastAPDeletedNode.get(), isMoveOperation);
+                        mergenewshares(1);
+                        if (!loggedIntoFolder())
+                            useralerts.convertNotedSharedNodes(true, originatingUser);
                     }
-
-                    name = jsonsc.getnameidvalue();
-
-                    // only process server-client request if not marked as
-                    // self-originating ("i" marker element guaranteed to be following
-                    // "a" element if present)
-                    if (fetchingnodes || !Utils::startswith(jsonsc.pos, "\"i\":\"") ||
-                        memcmp(jsonsc.pos + 5, sessionid, sizeof sessionid) ||
-                        jsonsc.pos[5 + sizeof sessionid] != '"' || name == name_id::d ||
-                        name == 't') // we still set 'i' on move commands to produce backward
-                                     // compatible actionpackets, so don't skip those here
-                    {
-#ifdef ENABLE_CHAT
-                        bool readingPublicChat = false;
-#endif
-                        switch (name)
-                        {
-                            case name_id::u:
-                                // node update
-                                sc_updatenode();
-                                break;
-
-                            case makeNameid("t"):
-                            {
-                                bool isMoveOperation = false;
-                                // node addition
-                                {
-                                    if (!loggedIntoFolder())
-                                        useralerts.beginNotingSharedNodes();
-                                    handle originatingUser = sc_newnodes(fetchingnodes ? nullptr : lastAPDeletedNode.get(), isMoveOperation);
-                                    mergenewshares(1);
-                                    if (!loggedIntoFolder())
-                                        useralerts.convertNotedSharedNodes(true, originatingUser);
-                                }
-                                lastAPDeletedNode = nullptr;
-                            }
-                            break;
-
-                            case name_id::d:
-                                // node deletion
-                                lastAPDeletedNode = sc_deltree();
-                                break;
-
-                            case makeNameid("s"):
-                            case makeNameid("s2"):
-                                // share addition/update/revocation
-                                if (sc_shares())
-                                {
-                                    int creqtag = reqtag;
-                                    reqtag = 0;
-                                    mergenewshares(1);
-                                    reqtag = creqtag;
-                                }
-                                break;
-
-                            case name_id::c:
-                                // contact addition/update
-                                sc_contacts();
-                                break;
-
-                            case makeNameid("fa"):
-                                // file attribute update
-                                sc_fileattr();
-                                break;
-
-                            case makeNameid("ua"):
-                                // user attribute update
-                                sc_userattr();
-                                break;
-
-                            case name_id::psts:
-                            case name_id::psts_v2:
-                            case makeNameid("ftr"):
-                                if (sc_upgrade(name))
-                                {
-                                    app->account_updated();
-                                    abortbackoff(true);
-                                }
-                                break;
-
-                            case name_id::pses:
-                                sc_paymentreminder();
-                                break;
-
-                            case name_id::ipc:
-                                // incoming pending contact request (to us)
-                                sc_ipc();
-                                break;
-
-                            case makeNameid("opc"):
-                                // outgoing pending contact request (from us)
-                                sc_opc();
-                                break;
-
-                            case name_id::upci:
-                                // incoming pending contact request update (accept/deny/ignore)
-                                sc_upc(true);
-                                break;
-
-                            case name_id::upco:
-                                // outgoing pending contact request update (from them, accept/deny/ignore)
-                                sc_upc(false);
-                                break;
-
-                            case makeNameid("ph"):
-                                // public links handles
-                                sc_ph();
-                                break;
-
-                            case makeNameid("se"):
-                                // set email
-                                sc_se();
-                                break;
-#ifdef ENABLE_CHAT
-                            case makeNameid("mcpc"):
-                            {
-                                readingPublicChat = true;
-                            } // fall-through
-                            case makeNameid("mcc"):
-                                // chat creation / peer's invitation / peer's removal
-                                sc_chatupdate(readingPublicChat);
-                                break;
-
-                            case makeNameid("mcfpc"): // fall-through
-                            case makeNameid("mcfc"):
-                                // chat flags update
-                                sc_chatflags();
-                                break;
-
-                            case makeNameid("mcpna"): // fall-through
-                            case makeNameid("mcna"):
-                                // granted / revoked access to a node
-                                sc_chatnode();
-                                break;
-
-                            case name_id::mcsmp:
-                                // scheduled meetings updates
-                                sc_scheduledmeetings();
-                                break;
-
-                            case name_id::mcsmr:
-                                // scheduled meetings removal
-                                sc_delscheduledmeeting();
-                                break;
-#endif
-                            case makeNameid("uac"):
-                                sc_uac();
-                                break;
-
-                            case makeNameid("la"):
-                                // last acknowledged
-                                sc_la();
-                                break;
-
-                            case makeNameid("ub"):
-                                // business account update
-                                sc_ub();
-                                break;
-
-                            case makeNameid("sqac"):
-                                // storage quota allowance changed
-                                sc_sqac();
-                                break;
-
-                            case makeNameid("asp"):
-                                // new/update of a Set
-                                sc_asp();
-                                break;
-
-                            case makeNameid("ass"):
-                                sc_ass();
-                                break;
-
-                            case makeNameid("asr"):
-                                // removal of a Set
-                                sc_asr();
-                                break;
-
-                            case makeNameid("aep"):
-                                // new/update of a Set Element
-                                sc_aep();
-                                break;
-
-                            case makeNameid("aer"):
-                                // removal of a Set Element
-                                sc_aer();
-                                break;
-                            case makeNameid("pk"):
-                                // pending keys
-                                sc_pk();
-                                break;
-
-                            case makeNameid("uec"):
-                                // User Email Confirm (uec)
-                                sc_uec();
-                                break;
-
-                            case makeNameid("cce"):
-                                // credit card for this user is potentially expiring soon or new card is registered
-                                sc_cce();
-                                break;
-                        }
-                    }
-                    else
-                    {
-                        lastAPDeletedNode = nullptr;
-                    }
+                    mScChunkedLastAPDeletedNode.reset();
                 }
+                break;
 
+                case name_id::d:
+                    // node deletion
+                    mScChunkedLastAPDeletedNode = sc_deltree();
+                    break;
+
+                case makeNameid("s"):
+                case makeNameid("s2"):
+                    // share addition/update/revocation
+                    if (sc_shares())
+                    {
+                        int creqtag = reqtag;
+                        reqtag = 0;
+                        mergenewshares(1);
+                        reqtag = creqtag;
+                    }
+                    break;
+
+                case name_id::c:
+                    // contact addition/update
+                    sc_contacts();
+                    break;
+
+                case makeNameid("fa"):
+                    // file attribute update
+                    sc_fileattr();
+                    break;
+
+                case makeNameid("ua"):
+                    // user attribute update
+                    sc_userattr();
+                    break;
+
+                case name_id::psts:
+                case name_id::psts_v2:
+                case makeNameid("ftr"):
+                    if (sc_upgrade(name))
+                    {
+                        app->account_updated();
+                        abortbackoff(true);
+                    }
+                    break;
+
+                case name_id::pses:
+                    sc_paymentreminder();
+                    break;
+
+                case name_id::ipc:
+                    // incoming pending contact request (to us)
+                    sc_ipc();
+                    break;
+
+                case makeNameid("opc"):
+                    // outgoing pending contact request (from us)
+                    sc_opc();
+                    break;
+
+                case name_id::upci:
+                    // incoming pending contact request update (accept/deny/ignore)
+                    sc_upc(true);
+                    break;
+
+                case name_id::upco:
+                    // outgoing pending contact request update (from them, accept/deny/ignore)
+                    sc_upc(false);
+                    break;
+
+                case makeNameid("ph"):
+                    // public links handles
+                    sc_ph();
+                    break;
+
+                case makeNameid("se"):
+                    // set email
+                    sc_se();
+                    break;
+#ifdef ENABLE_CHAT
+                case makeNameid("mcpc"):
+                {
+                    readingPublicChat = true;
+                } // fall-through
+                case makeNameid("mcc"):
+                    // chat creation / peer's invitation / peer's removal
+                    sc_chatupdate(readingPublicChat);
+                    break;
+
+                case makeNameid("mcfpc"): // fall-through
+                case makeNameid("mcfc"):
+                    // chat flags update
+                    sc_chatflags();
+                    break;
+
+                case makeNameid("mcpna"): // fall-through
+                case makeNameid("mcna"):
+                    // granted / revoked access to a node
+                    sc_chatnode();
+                    break;
+
+                case name_id::mcsmp:
+                    // scheduled meetings updates
+                    sc_scheduledmeetings();
+                    break;
+
+                case name_id::mcsmr:
+                    // scheduled meetings removal
+                    sc_delscheduledmeeting();
+                    break;
+#endif
+                case makeNameid("uac"):
+                    sc_uac();
+                    break;
+
+                case makeNameid("la"):
+                    // last acknowledged
+                    sc_la();
+                    break;
+
+                case makeNameid("ub"):
+                    // business account update
+                    sc_ub();
+                    break;
+
+                case makeNameid("sqac"):
+                    // storage quota allowance changed
+                    sc_sqac();
+                    break;
+
+                case makeNameid("asp"):
+                    // new/update of a Set
+                    sc_asp();
+                    break;
+
+                case makeNameid("ass"):
+                    sc_ass();
+                    break;
+
+                case makeNameid("asr"):
+                    // removal of a Set
+                    sc_asr();
+                    break;
+
+                case makeNameid("aep"):
+                    // new/update of a Set Element
+                    sc_aep();
+                    break;
+
+                case makeNameid("aer"):
+                    // removal of a Set Element
+                    sc_aer();
+                    break;
+                case makeNameid("pk"):
+                    // pending keys
+                    sc_pk();
+                    break;
+
+                case makeNameid("uec"):
+                    // User Email Confirm (uec)
+                    sc_uec();
+                    break;
+
+                case makeNameid("cce"):
+                    // credit card for this user is potentially expiring soon or new card is registered
+                    sc_cce();
+                    break;
+            }
+            if (*jsonsc.pos == '}')
+            {
                 jsonsc.leaveobject();
             }
-            else
+            if (*jsonsc.pos == ']')
             {
                 // No more Actions Packets. Force it to advance and process all the remaining
                 // command responses until a new "st" is found, if any.
@@ -5727,6 +6456,54 @@ bool MegaClient::procsc()
                 insca = false;
             }
         }
+        else
+        {
+            LOG_warn << "Skip self originating action.";
+            mScChunkedLastAPDeletedNode.reset();
+            if (!startpos) // processing on jsonsc, skip object
+            {
+                jsonsc.pos = actionStart;
+                jsonsc.storeobject();
+            }
+        }
+
+        // not processing on jsonsc, restore it
+        if (startpos)
+        {
+            jsonsc.pos = actionStart;
+        }
+    }
+    catch (...)
+    {
+        LOG_err << "Exception occurred while processing action packet in chunked mode";
+        // Restore jsonsc position on error
+        jsonsc.pos = actionStart;
+        return false;
+    }
+    return true;
+}
+
+// Process individual "t" element from chunked server-client request  
+void MegaClient::processTElement(const char* startpos)
+{
+    // Save current jsonsc position to restore if needed
+    const char* elementStart = jsonsc.pos;
+    
+    try
+    {
+        // Parse the "t" element using the stored JSON data
+        JSON elementJson;
+        elementJson.begin(startpos);
+        elementJson.pos = startpos;
+        readtree(&elementJson, fetchingnodes ? \
+            nullptr : mScChunkedLastAPDeletedNode.get(), 
+            mScChunkedFirstHandleMatchesDelete);
+    }
+    catch (...)
+    {
+        LOG_err << "Exception occurred while processing t element in chunked mode";
+        // Restore jsonsc position on error
+        jsonsc.pos = elementStart;
     }
 }
 
@@ -6738,7 +7515,7 @@ void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& fir
     {
         for (;;)
         {
-            switch (jsonsc.getnameid())
+            switch (j->getnameid()) // mis-use jsonsc?
             {
                 case makeNameid("f"):
                     if (auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen)))
@@ -6787,7 +7564,7 @@ void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& fir
                     return;
 
                 default:
-                    if (!jsonsc.storeobject())
+                    if (!j->storeobject()) // mis-use jsonsc?
                     {
                         return;
                     }
