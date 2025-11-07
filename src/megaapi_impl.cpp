@@ -33,6 +33,7 @@
 #include "mega/scoped_helpers.h"
 #include "mega/tlv.h"
 #include "mega/user_attribute.h"
+#include "mega/utils.h"
 #include "megaapi.h"
 
 #ifdef ENABLE_ISOLATED_GFX
@@ -19098,23 +19099,34 @@ unsigned MegaApiImpl::sendPendingTransfers(TransferQueue *queue, MegaRecursiveOp
                             forceToUpload= hasToForceUpload(*previousNode.get(), *transfer);
                             if (!forceToUpload)
                             {
-                                LOG_debug << "Previous node exists and the upload is not forced: "
-                                             "copy node handle";
-                                transfer->setState(MegaTransfer::STATE_QUEUED);
-                                transferMap[nextTag] = transfer;
-                                transfer->setTag(nextTag);
-                                transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
-                                transfer->setTransferredBytes(0);
-                                transfer->setStartTime(Waiter::ds);
-                                transfer->setUpdateTime(Waiter::ds);
-                                fireOnTransferStart(transfer);
-                                transfer->setNodeHandle(previousNode->nodehandle);
-                                transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
-                                transfer->setSpeed(0);
-                                transfer->setMeanSpeed(0);
-                                transfer->setState(MegaTransfer::STATE_COMPLETED);
-                                fireOnTransferFinish(transfer, std::make_unique<MegaErrorPrivate>(API_OK));
-                                break;
+                                // Check if MAC matches
+                                bool macMatches = false;
+                                auto fa = client->fsaccess->newfileaccess();
+                                if (fa->fopen(wLocalPath, true, false, FSLogging::logOnError))
+                                {
+                                    macMatches = CompareLocalFileMetaMacWithNode(fa.get(), previousNode.get());
+                                }
+                                
+                                if (macMatches)
+                                {
+                                    LOG_debug << "Previous node exists and the upload is not forced: "
+                                                 "copy node handle";
+                                    transfer->setState(MegaTransfer::STATE_QUEUED);
+                                    transferMap[nextTag] = transfer;
+                                    transfer->setTag(nextTag);
+                                    transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
+                                    transfer->setTransferredBytes(0);
+                                    transfer->setStartTime(Waiter::ds);
+                                    transfer->setUpdateTime(Waiter::ds);
+                                    fireOnTransferStart(transfer);
+                                    transfer->setNodeHandle(previousNode->nodehandle);
+                                    transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
+                                    transfer->setSpeed(0);
+                                    transfer->setMeanSpeed(0);
+                                    transfer->setState(MegaTransfer::STATE_COMPLETED);
+                                    fireOnTransferFinish(transfer, std::make_unique<MegaErrorPrivate>(API_OK));
+                                    break;
+                                }
                             }
                         }
                     }
@@ -19125,54 +19137,65 @@ unsigned MegaApiImpl::sendPendingTransfers(TransferQueue *queue, MegaRecursiveOp
                         std::shared_ptr<Node> samenode = client->mNodeManager.getNodeByFingerprint(fp_forCloud);
                         if (samenode && samenode->nodekey().size() && !hasToForceUpload(*samenode, *transfer))
                         {
-                            transfer->setState(MegaTransfer::STATE_QUEUED);
-                            transferMap[nextTag] = transfer;
-                            transfer->setTag(nextTag);
-                            transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
-                            transfer->setStartTime(Waiter::ds);
-                            transfer->setUpdateTime(Waiter::ds);
-                            fireOnTransferStart(transfer);
-
-                            TreeProcCopy tc;
-                            client->proctree(samenode, &tc, false, true);
-                            tc.allocnodes();
-                            client->proctree(samenode, &tc, false, true);
-                            tc.nn[0].parenthandle = UNDEF;
-
-                            SymmCipher key;
-                            AttrMap attrs;
-                            string attrstring;
-                            key.setkey((const byte*)tc.nn[0].nodekey.data(), samenode->type);
-                            string sname = fileName;
-                            LocalPath::utf8_normalize(&sname);
-                            attrs.map['n'] = sname;
-                            attrs.map['c'] = samenode->attrs.map['c'];
-                            attrs.getjson(&attrstring);
-                            client->makeattr(&key, tc.nn[0].attrstring, attrstring.c_str());
-                            if (tc.nn[0].type == FILENODE)
+                            // Check if MAC matches
+                            bool macMatches = false;
+                            auto fa = client->fsaccess->newfileaccess();
+                            if (fa->fopen(wLocalPath, true, false, FSLogging::logOnError))
                             {
-                                if (std::shared_ptr<Node> ovn = client->getovnode(parent.get(), &sname))
+                                macMatches = CompareLocalFileMetaMacWithNode(fa.get(), samenode.get());
+                            }
+                            
+                            if (macMatches)
+                            {
+                                transfer->setState(MegaTransfer::STATE_QUEUED);
+                                transferMap[nextTag] = transfer;
+                                transfer->setTag(nextTag);
+                                transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
+                                transfer->setStartTime(Waiter::ds);
+                                transfer->setUpdateTime(Waiter::ds);
+                                fireOnTransferStart(transfer);
+
+                                TreeProcCopy tc;
+                                client->proctree(samenode, &tc, false, true);
+                                tc.allocnodes();
+                                client->proctree(samenode, &tc, false, true);
+                                tc.nn[0].parenthandle = UNDEF;
+
+                                SymmCipher key;
+                                AttrMap attrs;
+                                string attrstring;
+                                key.setkey((const byte*)tc.nn[0].nodekey.data(), samenode->type);
+                                string sname = fileName;
+                                LocalPath::utf8_normalize(&sname);
+                                attrs.map['n'] = sname;
+                                attrs.map['c'] = samenode->attrs.map['c'];
+                                attrs.getjson(&attrstring);
+                                client->makeattr(&key, tc.nn[0].attrstring, attrstring.c_str());
+                                if (tc.nn[0].type == FILENODE)
                                 {
-                                    tc.nn[0].ovhandle = ovn->nodeHandle();
+                                    if (std::shared_ptr<Node> ovn = client->getovnode(parent.get(), &sname))
+                                    {
+                                        tc.nn[0].ovhandle = ovn->nodeHandle();
+                                    }
                                 }
-                            }
 
-                            if (uploadToInbox)
-                            {
-                                // obsolete feature, kept for sending logs to helpdesk
-                                client->putnodes(inboxTarget, std::move(tc.nn), nextTag);
-                            }
-                            else
-                            {
-                                client->putnodes(parent->nodeHandle(), UseLocalVersioningFlag, std::move(tc.nn), nullptr, nextTag, false);
-                            }
+                                if (uploadToInbox)
+                                {
+                                    // obsolete feature, kept for sending logs to helpdesk
+                                    client->putnodes(inboxTarget, std::move(tc.nn), nextTag);
+                                }
+                                else
+                                {
+                                    client->putnodes(parent->nodeHandle(), UseLocalVersioningFlag, std::move(tc.nn), nullptr, nextTag, false);
+                                }
 
-                            transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
-                            transfer->setSpeed(0);
-                            transfer->setMeanSpeed(0);
-                            transfer->setState(MegaTransfer::STATE_COMPLETING);
-                            fireOnTransferUpdate(transfer);
-                            break;
+                                transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
+                                transfer->setSpeed(0);
+                                transfer->setMeanSpeed(0);
+                                transfer->setState(MegaTransfer::STATE_COMPLETING);
+                                fireOnTransferUpdate(transfer);
+                                break;
+                            }
                         }
                     }
 
